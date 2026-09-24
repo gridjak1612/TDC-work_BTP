@@ -161,7 +161,11 @@ def main():
     lb_shift = {}
     off, _, _ = pairs(r1, A['lut'], B['lut'])
     _, sd, res = pairs(r2, A['lut'], B['lut'], off)
+    shift = sum(res) / len(res)
+    res = [x - shift for x in res]      # A-B launch skew is per SOURCE: remove it
     outl = sum(1 for x in res if abs(x) > 200) / len(res)
+    print(f"A-B offset: cal run {off:+.1f} ps; eval run differs by {shift:+.1f} ps "
+          f"(per-source launch skew, not a calibration error)")
 
     print(f"cal : {a.cal}  ({len(r1)} frames)")
     print(f"eval: {a.eval}  ({len(r2)} frames)\n")

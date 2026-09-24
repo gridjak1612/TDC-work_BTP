@@ -89,7 +89,7 @@ def residuals(Dc, De, LA, LB):
                 continue
             out.append((s * P + tb - ta, s, fa))
         return out
-    c = sorted(x[0] for x in raw(Dc)); off = c[len(c) // 2]
+        c = sorted(x[0] for x in raw(De)); off = c[len(c) // 2]   # offset of the EVAL source
     return [(x - off, s, fa) for x, s, fa in raw(De)]
 
 
