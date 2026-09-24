@@ -24,3 +24,4 @@ A LUT is only valid for the bitstream (placement) it was built from.
 | 0924c_e0f33e7_ro7_sync30_ds.csv | step 4 DUAL_SNAP=1, e0f33e7 | 3.17 M frames. Chain A dead zone 0. Chain B biased by the pairing bug (2.65 % timeouts): do NOT use lut_cd7_ds_b |
 | 0924d_0dcbbe8_ro7_sync30_ds.csv | DUAL_SNAP=1 + either-order pairing, 0dcbbe8, 5-min warm-up | 3.26 M frames; dead zone 0 both chains; 0 timeouts; sigma_pair 14.65 ps. LUT: lut_cd7_final (valid for 0dcbbe8 only) |
 | 0924e_0dcbbe8_ro7_sync30_ds.csv | 0dcbbe8, independent eval run for calib_report | 2.16 M frames; residual DNL rms 0.02 LSB, residual INL <= 7 ps, sigma 10.34 ps/ch |
+| 0925_multi_ro7.csv + 0925_multi_dps.csv | multi-source bitstream (EVENT_SRC=4), SW2 only (SW1 faulty) | RO7 2.99M, DPS 1.40M, dead zone 0 in both. Same-bitstream CD vs DPS: scale 0.5 %, shape +/-25 ps, CD LUT on DPS data 14.2-14.9 ps vs 11.2-12.1 ps |
