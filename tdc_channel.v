@@ -14,7 +14,7 @@
 //
 //   Chain:
 //     event_in (async) --> tdc_frontend (async conditioning, pass-through)
-//                      --> single_tdl (64x CARRY4 = 256 taps)
+//                      --> single_tdl (88x CARRY4 = 352 taps)
 //                      --> snapshot_pipeline (free-running, reach back 4 edges)
 //                      --> bubble_correction (5-tap majority)
 //                      --> ones_counter_encoder_piped  (352 -> 9, LATENCY 7)
@@ -41,7 +41,44 @@ module tdc_channel #(
     parameter integer FINE_BITS    = 9,    // 0..352 needs 9 bits
     parameter integer COARSE_BITS  = 14,
     parameter integer CAPTURE_LAG  = 4,     // capture_enable lags the golden edge
-    parameter integer FINE_LATENCY = 12     // popcount is now 7 deep: 1(bubble)+7 = 8 < 12
+    parameter integer FINE_LATENCY = 12,    // popcount is now 7 deep: 1(bubble)+7 = 8 < 12
+    parameter integer TAP_SRC      = 0,     // 0 = CO taps (normal), 1 = O taps (XORCY probe)
+
+    // -------------------------------------------------------------------------
+    // SYNC_TAP -- LAUNCH-SKEW FIX.
+    //
+    // The capture controller used to take stop_pulse from the RAW event. Its
+    // synchroniser therefore decides "which clock edge is the golden one" at
+    // the exact instant the carry chain is at tap 0. An event landing inside
+    // that flop's setup window resolves either way:
+    //     resolves 1 -> capture at edge N,   fine ~ 0
+    //     resolves 0 -> capture at edge N+1, fine ~ 293 (a full period later)
+    // Both readings rail against the ends of the chain, and a railed code
+    // carries no information -- which is the 125-143 ps dead zone measured at
+    // sweep phases 268..275.
+    //
+    // Taking stop_pulse from a tap PART-WAY DOWN the chain moves the
+    // synchroniser's decision point away from tap 0. Now the two possible
+    // resolutions are fine ~ SYNC_TAP and fine ~ SYNC_TAP + 293 -- and here is
+    // the point: BOTH ARE INSIDE THE CHAIN. When the sync resolves late the
+    // coarse counter also increments, so
+    //     coarse x 5000 ps  -  fine x tau
+    // is CONTINUOUS across the boundary: +1 coarse (+5000 ps) exactly cancels
+    // +293 fine (-5000 ps). The ambiguity stops being a dead zone and becomes
+    // a whole-period ambiguity that the coarse counter already resolves. It
+    // only works while fine does not rail, which is why SYNC_TAP must leave
+    // room at BOTH ends.
+    //
+    // Budget: one period spans 5000/17.05 = 293 taps of the 352 available, so
+    // there are 59 taps of slack. SYNC_TAP = 30 splits it about evenly:
+    // valid fine codes run 30..323, leaving ~30 taps of margin each side for
+    // jitter and PVT. Codes outside that window are now DETECTABLY bad rather
+    // than silently wrong.
+    //
+    // The constant SYNC_TAP offset cancels in the A-B difference. It must be
+    // subtracted for an absolute timestamp.
+    // -------------------------------------------------------------------------
+    parameter integer SYNC_TAP     = 30
 )(
     input  wire                    clk,           // clk200
     input  wire                    rst,           // active high
@@ -81,7 +118,11 @@ module tdc_channel #(
     // -------------------------------------------------------------------------
     wire [TDL_WIDTH-1:0] tdl_taps;
 
-    single_tdl #(.NUM_CARRY4(NUM_CARRY4)) tdl_inst (
+    // Drive the capture synchroniser from a mid-chain tap, not the raw event.
+    // SYNC_TAP = 0 restores the old behaviour for A/B comparison.
+    wire sync_src = (SYNC_TAP == 0) ? event_cond : tdl_taps[SYNC_TAP];
+
+    single_tdl #(.NUM_CARRY4(NUM_CARRY4), .TAP_SRC(TAP_SRC)) tdl_inst (
         .trigger (event_cond),
         .taps    (tdl_taps)
     );
@@ -95,7 +136,7 @@ module tdc_channel #(
     capture_controller cap_ctrl_inst (
         .capture_clk    (clk),
         .rst            (rst),
-        .stop_pulse     (event_cond),
+        .stop_pulse     (sync_src),
         .clear_status   (clear_status),
         .capture_enable (capture_enable),
         .done           (done)

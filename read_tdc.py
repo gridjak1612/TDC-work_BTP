@@ -1,189 +1,407 @@
 #!/usr/bin/env python3
 """
-read_tdc_dual.py -- host reader for the TWO-CHANNEL interval TDC.
+read_tdc.py -- host reader for the two-channel interval TDC, 8-byte frame.
 
-FRAME (5 bytes per measurement, 8N1 @ 115200):
+FRAME (8 bytes, 8N1 @ 2 Mbaud)
 
-    byte0 : 0xAA                                 sync header
-    byte1 : fine_a[7:0]                          START fine  (raw taps, chain A)
-    byte2 : fine_b[7:0]                          STOP  fine  (raw taps, chain B)
+    byte0 : 0xA5                                       sync header
+    byte1 : fine_a[7:0]
+    byte2 : fine_b[7:0]
     byte3 : d_coarse[7:0]
-    byte4 : {valid_b, valid_a, d_coarse[13:8]}
-              ^bit7    ^bit6   ^bits5:0
+    byte4 : {d_coarse[13:8], fine_a[8], fine_b[8]}
+    byte5 : phase_idx[7:0]
+    byte6 : {2'b00, valid_b, valid_a, phase_idx[11:8]}
+    byte7 : seq[7:0]
 
-RECONSTRUCTION
+WHAT CHANGED, AND WHY IT MATTERS
+--------------------------------
+The previous host parsed a FIVE byte frame while the RTL sent SIX. It stayed in
+sync by luck -- byte 5 was never 0xAA, so the resync path silently discarded it
+-- and therefore looked like it worked. It did not:
 
-    interval = d_coarse * 5.000 ns  -  ( fine_b * tau_b  -  fine_a * tau_a )
+  * fine codes above 255 aliased down by 256. The chain is 352 taps, so the top
+    27 % of the range was being folded on top of the bottom.
+  * the reported valid_a / valid_b were actually fine_a[8] / fine_b[8]. The real
+    thermometer-validity flags were thrown away.
 
-*** THE FINE DIFFERENCE IS SIGNED. ***
-fine_b - fine_a is negative about half the time, and that is CORRECT -- it just
-means the STOP landed later inside its clock window than the START did inside
-its. If you compute it in 8-bit unsigned arithmetic it wraps, and every affected
-interval comes out exactly one chain-span (~4 ns) wrong, silently. Python ints
-are arbitrary precision so this is safe here, but it WILL bite you if you ever
-port this to C or to the FPGA.
+Every histogram taken with that script is unusable. The header was changed from
+0xAA to 0xA5 specifically so that an old copy of this file fails loudly instead
+of repeating the trick.
 
-*** tau_a != tau_b. ***
-Chain A and chain B are different physical carry chains. They have different
-per-tap delays AND different per-bin widths. Until you run code-density
-calibration, both default to 16 ps and every number below is a FIRST-ORDER
-ESTIMATE. Do not quote a resolution from it.
+phase_idx is SIGNED 12-bit two's complement and is sign-extended below. Reading
+it unsigned puts every negative step near +4000 instead of just below zero,
+which folds the low half of a sweep onto the high half -- producing a
+calibration curve that looks entirely plausible and is wrong.
 
-Usage:
-    python read_tdc_dual.py COM19
-    python read_tdc_dual.py COM19 --tau-a 16.0 --tau-b 16.4
-    python read_tdc_dual.py COM19 --expect 21.008      # known cable/target delay
+seq increments on every measurement the FPGA completes, framed or not. A gap
+means a record was produced and dropped. That is a different thing from "no
+measurement happened", and for code-density work it is the difference between a
+genuinely empty bin and a lost sample.
+
+Usage
+    python read_tdc.py COM19
+    python read_tdc.py COM19 --samples 50000 --out sweep.csv
+    python read_tdc.py /dev/ttyUSB1 --baud 2000000 --seconds 60
+    python read_tdc.py --selftest          # no hardware needed
 """
 
 import sys
 import csv
+import math
+import time
 import argparse
-import statistics
-from collections import Counter
+from collections import Counter, defaultdict
 
-try:
-    import serial
-except ImportError:
-    sys.exit("pyserial not installed.  Run:  pip install pyserial")
-
-
-T_CLK_NS    = 5.000          # 200 MHz
-COARSE_BITS = 14
-FINE_MAX    = 255            # saturated
-WRAP_NS     = (1 << COARSE_BITS) * T_CLK_NS      # 81920.0 ns
+FRAME_LEN = 8
+HEADER = 0xA5
+TDL_TAPS = 352          # 88 CARRY4 x 4. fine ranges 0..352, NOT 0..255.
+T_CLK_NS = 5.000        # 200 MHz sampler
+PHASE_STEP_PS = 1000.0 / 56.0    # MMCM fine step = T_VCO/56, VCO = 1000 MHz
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Two-channel interval TDC reader")
-    p.add_argument("port")
-    p.add_argument("baud", nargs="?", type=int, default=115200)
-    p.add_argument("--tau-a", type=float, default=16.0, help="chain A per-tap delay, ps")
-    p.add_argument("--tau-b", type=float, default=16.0, help="chain B per-tap delay, ps")
-    p.add_argument("--expect", type=float, default=None,
-                   help="known true interval in ns (cable/target). Prints the residual.")
-    p.add_argument("--out", default="tdc_dual_log.csv")
-    return p.parse_args()
+# ---------------------------------------------------------------------------
+# Frame decode
+# ---------------------------------------------------------------------------
 
+def load_lut(path):
+    """
+    code -> arrival time in ps, from analyze_sweep.py.
+
+    Missing codes (zero-width bins) are interpolated: a sample can still carry
+    such a code because of jitter, and dropping those samples biases the result
+    toward the well-populated bins. Codes whose phase distribution is not
+    concentrated are dropped -- their t_ps is an average over the whole period
+    and therefore meaningless.
+    """
+    raw = {}
+    with open(path, newline='') as fh:
+        for r in csv.DictReader(fh):
+            if float(r.get('concentration', 1.0)) < 0.5:
+                continue
+            raw[int(r['code'])] = float(r['t_ps'])
+    if not raw:
+        return {}
+    ks = sorted(raw)
+    out = dict(raw)
+    for c in range(ks[0], ks[-1] + 1):
+        if c in out:
+            continue
+        lo = max(k for k in ks if k < c)
+        hi = min(k for k in ks if k > c)
+        a, b = raw[lo], raw[hi]
+        d = b - a
+        if d > 2500.0:
+            d -= 5000.0
+        elif d < -2500.0:
+            d += 5000.0
+        out[c] = (a + d * (c - lo) / (hi - lo)) % 5000.0
+    return out
+
+
+def interval_ps(r, lut_a, lut_b, t_clk_ns=T_CLK_NS):
+    """
+    Calibrated STOP - START interval in ps.
+
+        interval = d_coarse * T_clk  +  (t_a - t_b)
+
+    t_x comes from the LUT, which already absorbs the non-uniform bin widths.
+    Returns None when either code is outside the calibrated range -- better a
+    gap in the output than a number that looks fine and is not.
+    """
+    ta = lut_a.get(r['fine_a'])
+    tb = lut_b.get(r['fine_b'])
+    if ta is None or tb is None:
+        return None
+    return r['d_coarse'] * t_clk_ns * 1000.0 + (ta - tb)
+
+
+def unpack(f):
+    """Decode one 8-byte frame. Mirrors frame_w in tdc_dual_board.v."""
+    if len(f) != FRAME_LEN or f[0] != HEADER:
+        raise ValueError("not a frame")
+    fine_a = (((f[4] >> 1) & 1) << 8) | f[1]
+    fine_b = ((f[4] & 1) << 8) | f[2]
+    d_coarse = ((f[4] >> 2) << 8) | f[3]
+    phase_u = ((f[6] & 0x0F) << 8) | f[5]
+    phase = phase_u - 4096 if (phase_u & 0x800) else phase_u   # sign-extend 12b
+    valid_a = (f[6] >> 4) & 1
+    valid_b = (f[6] >> 5) & 1
+    seq = f[7]
+    return dict(fine_a=fine_a, fine_b=fine_b, d_coarse=d_coarse,
+                phase=phase, valid_a=valid_a, valid_b=valid_b, seq=seq)
+
+
+class Framer:
+    """
+    Byte-stream -> frames, with stride-verified sync.
+
+    A payload byte can legitimately equal 0xA5, so "first byte is 0xA5" is not
+    proof of alignment. Sync is only declared once headers land at the correct
+    8-byte stride LOCK_FRAMES times running, and is dropped the moment the
+    stride breaks. Accepting on a single header match is how a misaligned
+    stream gets parsed as valid data.
+    """
+    LOCK_FRAMES = 3
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.locked = False
+        self.streak = 0
+        self.resyncs = 0
+
+    def feed(self, chunk):
+        self.buf.extend(chunk)
+        out = []
+        while len(self.buf) >= FRAME_LEN:
+            if self.buf[0] != HEADER:
+                del self.buf[0]
+                if self.locked:
+                    self.locked = False
+                    self.streak = 0
+                    self.resyncs += 1
+                continue
+            frame = bytes(self.buf[:FRAME_LEN])
+            del self.buf[:FRAME_LEN]
+            if self.locked:
+                out.append(unpack(frame))
+            else:
+                self.streak += 1
+                if self.streak >= self.LOCK_FRAMES:
+                    self.locked = True
+                    out.append(unpack(frame))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Accounting
+# ---------------------------------------------------------------------------
+
+class Stats:
+    def __init__(self):
+        self.n = 0
+        self.dropped = 0
+        self.prev_seq = None
+        self.hist = {'a': defaultdict(Counter), 'b': defaultdict(Counter)}
+        self.invalid_a = 0
+        self.invalid_b = 0
+        self.railed = 0
+
+    def add(self, r):
+        self.n += 1
+        if self.prev_seq is not None:
+            gap = (r['seq'] - self.prev_seq - 1) & 0xFF
+            self.dropped += gap
+        self.prev_seq = r['seq']
+
+        if not r['valid_a']:
+            self.invalid_a += 1
+        if not r['valid_b']:
+            self.invalid_b += 1
+        if r['fine_a'] in (0, TDL_TAPS) or r['fine_b'] in (0, TDL_TAPS):
+            self.railed += 1
+
+        # Only thermometer-legal codes go into the calibration histograms.
+        if r['valid_a']:
+            self.hist['a'][r['phase']][r['fine_a']] += 1
+        if r['valid_b']:
+            self.hist['b'][r['phase']][r['fine_b']] += 1
+
+    def report(self):
+        print()
+        print("=" * 78)
+        print(f"  frames received : {self.n}")
+        produced = self.n + self.dropped
+        if produced:
+            print(f"  frames dropped  : {self.dropped}  "
+                  f"({100.0 * self.dropped / produced:.2f} % of measurements produced)")
+        print(f"  invalid code A  : {self.invalid_a}   invalid code B : {self.invalid_b}")
+        print(f"  railed (0 or {TDL_TAPS}) : {self.railed}")
+
+        for ch in ('a', 'b'):
+            phases = sorted(self.hist[ch])
+            if not phases:
+                continue
+            allcodes = Counter()
+            for p in phases:
+                allcodes.update(self.hist[ch][p])
+            print()
+            print(f"  --- chain {ch.upper()} ---")
+            print(f"      phase steps seen : {len(phases)}  "
+                  f"[{phases[0]} .. {phases[-1]}]")
+            print(f"      distinct codes   : {len(allcodes)} / {TDL_TAPS + 1}")
+            print(f"      never seen       : {TDL_TAPS + 1 - len(allcodes)} codes")
+            # codes 1 and 2 were structurally impossible before the
+            # bubble_correction low-boundary fix -- their presence is the
+            # hardware proof that the fix is in this bitstream.
+            print(f"      code 1 count     : {allcodes.get(1, 0)}"
+                  f"      code 2 count : {allcodes.get(2, 0)}")
+            if len(phases) > 1:
+                print(f"      mean code vs phase (first/last step): "
+                      f"{_mean(self.hist[ch][phases[0]]):.1f} -> "
+                      f"{_mean(self.hist[ch][phases[-1]]):.1f}")
+        print("=" * 78)
+        print("  Codes are RAW tap counts. No LUT applied. Do not quote a")
+        print("  resolution from these numbers.")
+        print("=" * 78)
+
+
+def _mean(counter):
+    tot = sum(counter.values())
+    return sum(k * v for k, v in counter.items()) / tot if tot else float('nan')
+
+
+# ---------------------------------------------------------------------------
+# Self-test -- runs without hardware, checks against RTL-generated vectors
+# ---------------------------------------------------------------------------
+
+VECTORS = [
+    # fine_a fine_b d_coarse va vb phase seq   bytes
+    ((0,     0,     0,       0, 0, 0,     0),   "a5 00 00 00 00 00 00 00"),
+    ((1,     2,     3,       1, 1, 1,     1),   "a5 01 02 03 00 01 30 01"),
+    ((351,   352,   16383,   1, 0, 279,   200), "a5 5f 60 ff ff 17 11 c8"),
+    ((300,   260,   1234,    0, 1, -1,    255), "a5 2c 04 d2 13 ff 2f ff"),
+    ((256,   255,   8192,    1, 1, -280,  77),  "a5 00 ff 00 82 e8 3e 4d"),
+    ((128,   64,    0,       1, 1, -2048, 1),   "a5 80 40 00 00 00 38 01"),
+    ((511,   511,   16383,   1, 1, 2047,  254), "a5 ff ff ff ff ff 37 fe"),
+]
+
+
+def selftest():
+    """Decode byte vectors produced by the actual RTL frame_w expression."""
+    bad = 0
+    for (fa, fb, dc, va, vb, ph, sq), hexs in VECTORS:
+        f = bytes(int(x, 16) for x in hexs.split())
+        r = unpack(f)
+        want = dict(fine_a=fa, fine_b=fb, d_coarse=dc,
+                    valid_a=va, valid_b=vb, phase=ph, seq=sq)
+        if r != want:
+            bad += 1
+            print(f"  MISMATCH {hexs}")
+            for k in want:
+                if r[k] != want[k]:
+                    print(f"      {k}: got {r[k]}  want {want[k]}")
+    print(f"unpack(): {len(VECTORS) - bad}/{len(VECTORS)} RTL vectors decoded correctly")
+
+    # framer must reject a stream offset by one byte rather than locking to it
+    good = b"".join(bytes(int(x, 16) for x in h.split()) for _, h in VECTORS) * 3
+    fr = Framer()
+    n_ok = len(fr.feed(good))
+    fr2 = Framer()
+    n_shift = len(fr2.feed(b"\x00" + good[:-1]))
+    print(f"framer  : aligned stream -> {n_ok} frames "
+          f"(expect {len(VECTORS) * 3 - Framer.LOCK_FRAMES + 1})")
+    print(f"framer  : resyncs on offset stream = {fr2.resyncs > 0 or n_shift < n_ok}")
+
+    # sequence-gap accounting must survive the 8-bit wrap
+    st = Stats()
+    for s in (253, 254, 255, 0, 1):
+        st.add(dict(fine_a=10, fine_b=10, d_coarse=0, phase=0,
+                    valid_a=1, valid_b=1, seq=s))
+    print(f"seq wrap: dropped = {st.dropped} (expect 0)")
+    st2 = Stats()
+    for s in (10, 13):
+        st2.add(dict(fine_a=10, fine_b=10, d_coarse=0, phase=0,
+                     valid_a=1, valid_b=1, seq=s))
+    print(f"seq gap : dropped = {st2.dropped} (expect 2)")
+    return 0 if bad == 0 else 1
+
+
+# ---------------------------------------------------------------------------
 
 def main():
-    a = parse_args()
-    tau_a = a.tau_a / 1000.0     # ps -> ns
-    tau_b = a.tau_b / 1000.0
+    p = argparse.ArgumentParser(description="Two-channel TDC reader, 8-byte frame")
+    p.add_argument("port", nargs="?")
+    p.add_argument("--baud", type=int, default=2000000)
+    p.add_argument("--out", default="tdc_log.csv")
+    p.add_argument("--samples", type=int, default=None, help="stop after N frames")
+    p.add_argument("--seconds", type=float, default=None, help="stop after N seconds")
+    p.add_argument("--quiet", action="store_true", help="do not print every frame")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--lut", default=None,
+                   help="LUT prefix from analyze_sweep.py; loads <p>_a.csv and "
+                        "<p>_b.csv and adds a calibrated interval_ps column")
+    a = p.parse_args()
 
-    ser = serial.Serial(a.port, a.baud, timeout=1)
-    print(f"Listening on {a.port} @ {a.baud} 8N1.  Ctrl-C to stop.")
-    print(f"T_clk = {T_CLK_NS:.3f} ns   tau_a = {a.tau_a:.2f} ps   tau_b = {a.tau_b:.2f} ps")
-    print(f"interval = d_coarse x 5.000 ns - (fine_b x tau_b - fine_a x tau_a)")
-    print("-" * 88)
+    if a.selftest:
+        sys.exit(selftest())
+    if not a.port:
+        p.error("port is required (or use --selftest)")
 
-    n = 0
-    hist_a, hist_b = Counter(), Counter()
-    good_intervals = []
-    n_bad = 0
+    try:
+        import serial
+    except ImportError:
+        sys.exit("pyserial not installed.  pip install pyserial")
 
-    with open(a.out, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["index", "d_coarse", "fine_a", "fine_b",
-                    "valid_a", "valid_b", "usable", "interval_ns"])
+    lut_a = lut_b = None
+    if a.lut:
+        lut_a = load_lut(f"{a.lut}_a.csv")
+        lut_b = load_lut(f"{a.lut}_b.csv")
+        print(f"LUT loaded: chain A {len(lut_a)} codes, chain B {len(lut_b)} codes")
+        print("Output carries a calibrated interval_ps column. Raw codes are kept")
+        print("alongside it -- never discard them, the LUT is only valid for the")
+        print("bitstream it was measured on and you will want to recheck.")
 
-        buf = bytearray()
+    ser = serial.Serial(a.port, a.baud, timeout=0.1)
+    print(f"Listening on {a.port} @ {a.baud} 8N1, 8-byte frames. Ctrl-C to stop.")
+    print(f"phase step = {PHASE_STEP_PS:.3f} ps, "
+          f"{round(T_CLK_NS * 1000 / PHASE_STEP_PS)} steps per {T_CLK_NS} ns period")
+    print("-" * 78)
+
+    fr = Framer()
+    st = Stats()
+    t0 = time.time()
+
+    with open(a.out, "w", newline="") as fh:
+        w = csv.writer(fh)
+        cols = ["seq", "phase", "d_coarse", "fine_a", "fine_b",
+                "valid_a", "valid_b"]
+        if lut_a:
+            cols.append("interval_ps")
+        w.writerow(cols)
+        ivals = []
         try:
             while True:
-                b = ser.read(1)
-                if not b:
-                    continue
-                buf.append(b[0])
-
-                if buf[0] != 0xAA:        # resync on the header
-                    buf.clear()
-                    continue
-                if len(buf) < 5:
-                    continue
-
-                _, fa, fb, dc_lo, hi = buf
-                buf.clear()
-
-                fine_a   = fa
-                fine_b   = fb
-                d_coarse = ((hi & 0x3F) << 8) | dc_lo
-                valid_a  = (hi >> 6) & 1
-                valid_b  = (hi >> 7) & 1
-
-                # ---- SIGNED difference. Python ints; never do this in uint8. ----
-                interval = d_coarse * T_CLK_NS - (int(fine_b) * tau_b - int(fine_a) * tau_a)
-
-                # A sample is only usable if BOTH codes are legal thermometers and
-                # NEITHER chain railed. A railed chain (0 or 255) carries no phase
-                # information -- see the dead-zone analysis.
-                sat_a   = fine_a in (0, FINE_MAX)
-                sat_b   = fine_b in (0, FINE_MAX)
-                usable  = valid_a and valid_b and not sat_a and not sat_b
-
-                n += 1
-                flags = ""
-                if not valid_b and d_coarse == 0 and fine_b == 0:
-                    flags += "  [NO STOP - timeout]"
-                if sat_a:
-                    flags += "  [A railed]"
-                if sat_b:
-                    flags += "  [B railed]"
-
-                if usable:
-                    good_intervals.append(interval)
-                    hist_a[fine_a] += 1
-                    hist_b[fine_b] += 1
-                else:
-                    n_bad += 1
-
-                print(f"[{n:6d}] dc={d_coarse:5d}  fine_a={fine_a:3d}  fine_b={fine_b:3d}  "
-                      f"va={valid_a} vb={valid_b}  interval={interval:10.3f} ns{flags}")
-
-                w.writerow([n, d_coarse, fine_a, fine_b, valid_a, valid_b,
-                            int(usable), f"{interval:.3f}"])
-                f.flush()
-
+                # Batched read. One byte at a time cannot keep up at 2 Mbaud
+                # and the OS buffer overflows -- which shows up as dropped
+                # frames that look like an FPGA problem but are not.
+                chunk = ser.read(max(1, ser.in_waiting))
+                for r in fr.feed(chunk):
+                    st.add(r)
+                    row = [r['seq'], r['phase'], r['d_coarse'],
+                           r['fine_a'], r['fine_b'],
+                           r['valid_a'], r['valid_b']]
+                    if lut_a:
+                        iv = interval_ps(r, lut_a, lut_b)
+                        row.append("" if iv is None else f"{iv:.2f}")
+                        if iv is not None and r['valid_a'] and r['valid_b']:
+                            ivals.append(iv)
+                    w.writerow(row)
+                    if not a.quiet and st.n % 200 == 1:
+                        print(f"[{st.n:7d}] ph={r['phase']:+5d}  "
+                              f"fa={r['fine_a']:4d} fb={r['fine_b']:4d}  "
+                              f"dc={r['d_coarse']:5d}  "
+                              f"va={r['valid_a']} vb={r['valid_b']}  "
+                              f"drop={st.dropped}")
+                if a.samples and st.n >= a.samples:
+                    break
+                if a.seconds and (time.time() - t0) >= a.seconds:
+                    break
         except KeyboardInterrupt:
             pass
 
-    # ------------------------------------------------------------------------
-    print()
-    print("=" * 88)
-    print(f"  {n} frames -> {a.out}")
-    if n == 0:
-        return
-    print(f"  usable : {len(good_intervals):6d}  ({100*len(good_intervals)/n:5.1f} %)")
-    print(f"  reject : {n_bad:6d}  ({100*n_bad/n:5.1f} %)   (invalid code, railed chain, or no STOP)")
-
-    for name, h in (("A (START)", hist_a), ("B (STOP)", hist_b)):
-        if not h:
-            continue
-        tot = sum(h.values())
-        ev  = sum(c for k, c in h.items() if k % 2 == 0)
+    if lut_a and ivals:
+        m = sum(ivals) / len(ivals)
+        sd = math.sqrt(sum((x - m) ** 2 for x in ivals) / len(ivals))
         print()
-        print(f"  --- chain {name} fine histogram ({tot} samples) ---")
-        print(f"      distinct codes : {len(h)} / 254")
-        print(f"      EVEN codes     : {100*ev/tot:5.1f} %   (50 % if bins were uniform)")
-        print(f"      zero-width bins: {254 - len(h)} codes never seen "
-              f"-> taps flipping simultaneously")
+        print(f"  calibrated interval : mean {m:.2f} ps   sigma {sd:.2f} ps"
+              f"   (n={len(ivals)})")
+        print(f"  implied single-shot : {sd / math.sqrt(2):.2f} ps"
+              f"   (two similar independent chains)")
 
-    if len(good_intervals) >= 2:
-        mean = statistics.mean(good_intervals)
-        sd   = statistics.pstdev(good_intervals)
-        print()
-        print("  --- interval statistics ---")
-        print(f"      mean  = {mean:10.3f} ns")
-        print(f"      sigma = {sd*1000:10.1f} ps      <-- single-shot precision of the PAIR")
-        print(f"      (if both chains share one source, sigma_single = sigma/sqrt(2) "
-              f"= {sd*1000/1.4142:.1f} ps)")
-        if a.expect is not None:
-            print(f"      expected  = {a.expect:10.3f} ns")
-            print(f"      residual  = {(mean - a.expect)*1000:+10.1f} ps   "
-                  f"<-- this is the fixed offset K; it cancels if you take a DIFFERENCE "
-                  f"of two cable lengths")
-    print("=" * 88)
-    print("  Both taus are UNCALIBRATED defaults. Run code-density calibration")
-    print("  (>= 1e5 samples, asynchronous source) before quoting any resolution.")
-    print("=" * 88)
+    print(f"\n  {st.n} frames -> {a.out}   ({time.time() - t0:.1f} s)")
+    if fr.resyncs:
+        print(f"  WARNING: {fr.resyncs} resync events -- check baud and cabling")
+    st.report()
 
 
 if __name__ == "__main__":

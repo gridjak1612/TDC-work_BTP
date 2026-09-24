@@ -50,33 +50,44 @@ module bubble_correction #(
     // Majority of 5 bits = 1 when 3 or more inputs are 1.
     // Implemented as: sum of 5 bits >= 3.
     //
-    // Boundary handling:
-    //   Missing neighbors are assumed to be 0.
-    //   - Bit 0:       window = {0,       0,       raw[0], raw[1], raw[2]}
-    //   - Bit 1:       window = {0,       raw[0],  raw[1], raw[2], raw[3]}
-    //   - Bit WIDTH-2: window = {raw[W-4], raw[W-3], raw[W-2], raw[W-1], 0}
-    //   - Bit WIDTH-1: window = {raw[W-3], raw[W-2], raw[W-1], 0,         0}
+    // Boundary handling -- THE PADDING IS ASYMMETRIC. READ THIS BEFORE EDITING.
     //
-    // This is correct because:
-    //   - Below the transition region, taps should be 0.
-    //   - Above the transition region, taps should be 1.
-    //   - At the boundaries, padding with 0 avoids false positives.
+    // The TDL fills from tap 0 UPWARD: taps[0 .. fine-1] = 1, taps[fine ..] = 0.
+    // So the virtual taps BELOW index 0 are logically ONE, and the virtual taps
+    // ABOVE index WIDTH-1 are logically ZERO.
+    //
+    //   - Bit 0:       window = {1,        1,        raw[0],   raw[1],   raw[2]}
+    //   - Bit 1:       window = {1,        raw[0],   raw[1],   raw[2],   raw[3]}
+    //   - Bit WIDTH-2: window = {raw[W-4], raw[W-3], raw[W-2], raw[W-1], 0}
+    //   - Bit WIDTH-1: window = {raw[W-3], raw[W-2], raw[W-1], 0,        0}
+    //
+    // Padding the LOW end with ZEROS (as an earlier revision did) gives
+    //   corrected[0] = raw[0] & raw[1] & raw[2]
+    //   corrected[1] = (raw[0]+raw[1]+raw[2]+raw[3] >= 3)
+    // and fine codes 1 and 2 BOTH collapse to 0 on every single sample. Bin 0
+    // then absorbs three taps (~52 ps at 17.4 ps/tap) -- a systematic DNL
+    // defect LARGER than the single-shot precision of the instrument, and one
+    // that looks exactly like a silicon artefact in a code-density histogram.
+    // It is not silicon. It is this comment having been written upside down.
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
-    // Bit 0: window = {0, 0, raw[0], raw[1], raw[2]}
-    // Sum can be at most 3. Majority if sum >= 3.
+    // Bit 0: window = {1, 1, raw[0], raw[1], raw[2]}
+    // Two padded ones, so majority (>=3 of 5) reduces to sum(raw[0:2]) >= 1.
     // -------------------------------------------------------------------------
+    // window = {1, 1, raw[0], raw[1], raw[2]} -> majority when sum >= 1
     wire [2:0] sum_0;
     assign sum_0 = raw_therm[0] + raw_therm[1] + raw_therm[2];
-    assign corrected[0] = (sum_0 >= 3'd3);
+    assign corrected[0] = (sum_0 >= 3'd1);
 
     // -------------------------------------------------------------------------
-    // Bit 1: window = {0, raw[0], raw[1], raw[2], raw[3]}
+    // Bit 1: window = {1, raw[0], raw[1], raw[2], raw[3]}
+    // One padded one, so majority (>=3 of 5) reduces to sum(raw[0:3]) >= 2.
     // -------------------------------------------------------------------------
+    // window = {1, raw[0], raw[1], raw[2], raw[3]} -> majority when sum >= 2
     wire [2:0] sum_1;
     assign sum_1 = raw_therm[0] + raw_therm[1] + raw_therm[2] + raw_therm[3];
-    assign corrected[1] = (sum_1 >= 3'd3);
+    assign corrected[1] = (sum_1 >= 3'd2);
 
     // -------------------------------------------------------------------------
     // Interior Bits [2 .. WIDTH-3]: full 5-tap window

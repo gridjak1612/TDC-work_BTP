@@ -2,16 +2,31 @@
 // Module Name:  tdc_dual_board
 // Description:  Board top for the TWO-CHANNEL interval TDC.
 //
-//   UART FRAME - 6 bytes per measurement, 8N1 @ 115200
-//     byte0 : 0xAA                                     sync header
-//     byte1 : fine_a[7:0]                              START fine, low  8 bits
-//     byte2 : fine_b[7:0]                              STOP  fine, low  8 bits
-//     byte3 : d_coarse[7:0]                            interval coarse, low
-//     byte4 : {fine_b[8], fine_a[8], d_coarse[13:8]}   fine MSBs + coarse high
-//     byte5 : {6'b000000, valid_b, valid_a}            both valid flags
+//   UART FRAME - 8 bytes per measurement, 8N1 @ 2 Mbaud
+//     byte0 : 0xA5                                       sync header
+//     byte1 : fine_a[7:0]                                START fine, low 8
+//     byte2 : fine_b[7:0]                                STOP  fine, low 8
+//     byte3 : d_coarse[7:0]
+//     byte4 : {d_coarse[13:8], fine_a[8], fine_b[8]}     coarse high + fine MSBs
+//     byte5 : phase_idx[7:0]                             MMCM phase, low 8
+//     byte6 : {2'b00, valid_b, valid_a, phase_idx[11:8]} flags + phase high
+//     byte7 : seq[7:0]                                   per-measurement counter
 //
-//   Six bytes, not five: `fine` is now 9 bits (0..352), so the two MSBs need
-//   somewhere to live. 9+9+14+2 = 34 bits -> 5 payload bytes + 1 header.
+//   phase_idx is SIGNED 12-bit two's complement. The host must sign-extend it;
+//   reading it as unsigned puts every negative phase step at ~4000 instead of
+//   just below zero, which folds the low half of the sweep on top of the high
+//   half and produces a calibration curve that looks plausible and is wrong.
+//
+//   seq increments on EVERY meas_ready, framed or not. A gap in the received
+//   sequence means a measurement was produced and DROPPED -- distinct from no
+//   measurement at all. Code-density work needs that distinction: otherwise a
+//   lost sample is indistinguishable from a genuinely empty bin.
+//
+//   Header is 0xA5, not the old 0xAA, so a stale host fails loudly rather than
+//   silently mis-decoding (which is what the 5-vs-6 byte mismatch did).
+//
+//   Frame time = 8 bytes x 10 bits / 2e6 = 40 us -> 25 kframe/s.
+//   CLKS_PER_BIT = 200e6/2e6 = 100 exactly; no divisor error.
 //
 //   RAW fields are shipped, NOT a computed time. tau_a != tau_b and neither is
 //   a single number (bins are non-uniform), so the conversion is a per-channel
@@ -39,11 +54,25 @@
 `timescale 1ns/1ps
 
 module tdc_dual_board #(
-    parameter integer CLKS_PER_BIT = 1736,   // 200 MHz / 115200
-    parameter integer EVENT_SRC    = 0,      // 0 = buttons, 1 = external pins
+    // 200 MHz / 2 000 000 = 100 EXACTLY. Zero divisor error, unlike
+    // 3 Mbaud (66.67 -> 66 -> +1.0 % per bit, 10 % of a bit by the stop).
+    // 8 bytes x 10 bits / 2 Mbaud = 40 us/frame -> 25 kframe/s.
+    parameter integer CLKS_PER_BIT = 100,    // 200 MHz / 2 Mbaud
+    parameter integer EVENT_SRC    = 2,      // 0 = buttons, 1 = external pins
     parameter integer TIE_CHANNELS = 0,      // 1 = drive both chains from A
     parameter integer HB_BIT       = 26,
-    parameter integer VIS_BITS     = 24
+    parameter integer VIS_BITS     = 24,
+    // ---- autonomous DPS sweep ------------------------------------------------
+    parameter integer AUTO_SWEEP       = 1,     // 0 = manual buttons only
+    parameter integer SWEEP_STEPS      = 280,   // 280 x 17.857 ps = 5.000 ns
+    parameter integer SAMPLES_PER_STEP = 256,
+    // MMCM phase shift settles in a few VCO cycles; 2000 clk200 (10 us) is
+    // ~250 clk_cal periods and is deliberately generous. 280 steps x 10 us
+    // = 2.8 ms per traversal, negligible against 280 x 256 x 40 us = 2.9 s of
+    // measurement. Do not trim this to save time you will not notice.
+    parameter integer SETTLE_CYCLES    = 2000,
+    parameter integer TAP_SRC          = 0,   // 1 = XORCY probe build
+    parameter integer SYNC_TAP         = 30   // 0 = old raw-event sync
 )(
     input  wire        clk100,        // F14
     input  wire        rst,           // J2  btn0
@@ -68,28 +97,45 @@ module tdc_dual_board #(
     wire event_b_src;
 
     generate
-        if (EVENT_SRC == 0) begin : g_btn
-            assign event_a_src = btn_a;
-            assign event_b_src = (TIE_CHANNELS != 0) ? btn_a : btn_b;
-        end else begin : g_ext
-            assign event_a_src = ev_a_ext;
-            assign event_b_src = (TIE_CHANNELS != 0) ? ev_a_ext : ev_b_ext;
-        end
+    if (EVENT_SRC == 0) begin : g_btn
+        assign event_a_src = btn_a;
+        assign event_b_src = (TIE_CHANNELS != 0) ? btn_a : btn_b;
+    end else if (EVENT_SRC == 1) begin : g_ext
+        assign event_a_src = ev_a_ext;
+        assign event_b_src = (TIE_CHANNELS != 0) ? ev_a_ext : ev_b_ext;
+    end else begin : g_cal            // EVENT_SRC == 2: calibration
+        assign event_a_src = 1'b0;    // unused: core drives both chains from clk_cal
+        assign event_b_src = 1'b0;
+    end
     endgenerate
 
     // -------------------------------------------------------------------------
     // Core
     // -------------------------------------------------------------------------
-    wire [COARSE_BITS-1:0] d_coarse;
-    wire [FINE_BITS-1:0]   fine_a, fine_b;
-    wire                   valid_a, valid_b, timeout, meas_ready;
-    wire                   done_a, done_b, clk200, mmcm_locked;
+    localparam integer CAL_EVENT_MODE = (EVENT_SRC == 2) ? 1 : 0;
+    localparam integer PHASE_BITS     = 12;
 
+    (* MARK_DEBUG = "true" *) wire [PHASE_BITS-1:0] ps_phase_idx;
+    (* MARK_DEBUG = "true" *) wire                  ps_busy;
+    (* MARK_DEBUG = "true" *) wire                  ps_error;
+    reg                                             sweep_step_req;
+    reg                                             sweep_dir;   // dir for the NEXT step
+    reg                                             sweep_dir_q; // dir presented WITH the request
+        wire                                            clk_cal;
+    (* MARK_DEBUG = "true" *) wire [COARSE_BITS-1:0] d_coarse;
+    (* MARK_DEBUG = "true" *) wire [FINE_BITS-1:0]   fine_a, fine_b;
+    (* MARK_DEBUG = "true" *) wire                   valid_a, valid_b;
+    (* MARK_DEBUG = "true" *) wire                   meas_ready;
+    (* MARK_DEBUG = "true" *) wire                   mmcm_locked;
+    wire                                            timeout;
+    wire                                            done_a, done_b, clk200;
     wire rearm;
+
 
     tdc_dual_top #(
         .NUM_CARRY4(88), .TDL_WIDTH(352), .FINE_BITS(FINE_BITS),
-        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(4), .FINE_LATENCY(12)
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(4), .FINE_LATENCY(12),
+        .CAL_EVENT(CAL_EVENT_MODE), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .PHASE_BITS(PHASE_BITS)
     ) core (
         .clk100       (clk100),
         .rst          (rst),
@@ -106,74 +152,127 @@ module tdc_dual_board #(
         .done_a       (done_a),
         .done_b       (done_b),
         .clk200       (clk200),
-        .mmcm_locked  (mmcm_locked)
+        .mmcm_locked  (mmcm_locked),
+        .ps_step_btn  (btn_a),   // reuse btn_a as PHASE STEP in the calibration build
+        .ps_dir_btn   (btn_b),   // reuse btn_b as DIRECTION (held = decrement)
+        .ps_step_req  (sweep_step_req),
+        .ps_dir_req   (sweep_dir_q),
+        .ps_phase_idx (ps_phase_idx),
+        .ps_busy      (ps_busy),
+        .ps_error     (ps_error),
+        .clk_cal      (clk_cal)
     );
 
     wire rst200 = rst | ~mmcm_locked;
 
     // -------------------------------------------------------------------------
-    // Latch the record on meas_ready
+    // Latch the record on meas_ready.
+    //
+    // ph_l  : the MMCM phase index that produced this sample. Without it the
+    //         host receives fine codes with no idea which phase step they
+    //         belong to, and a DPS sweep is not reconstructable -- the samples
+    //         are just an undifferentiated pile.
+    //
+    // seq_l : free-running per-measurement counter. It increments on EVERY
+    //         meas_ready, whether or not the record actually gets framed. A
+    //         gap in the received sequence therefore means "a measurement
+    //         happened and was dropped", which is a completely different thing
+    //         from "no measurement happened". For code-density work that is
+    //         the difference between a real empty bin and a lost sample, and
+    //         previously there was no way to tell them apart.
     // -------------------------------------------------------------------------
     reg [COARSE_BITS-1:0] dc_l;
     reg [FINE_BITS-1:0]   fa_l, fb_l;
     reg                   va_l, vb_l;
+    reg [PHASE_BITS-1:0]  ph_l;
+    reg [7:0]             seq_l, seq_cnt;
 
     always @(posedge clk200) begin
-        if (meas_ready) begin
-            dc_l <= d_coarse;
-            fa_l <= fine_a;
-            fb_l <= fine_b;
-            va_l <= valid_a;
-            vb_l <= valid_b;
+        if (rst200) begin
+            dc_l <= {COARSE_BITS{1'b0}};
+            fa_l <= {FINE_BITS{1'b0}};  fb_l <= {FINE_BITS{1'b0}};
+            va_l <= 1'b0;               vb_l <= 1'b0;
+            ph_l <= {PHASE_BITS{1'b0}};
+            seq_l <= 8'd0;              seq_cnt <= 8'd0;
+        end else if (meas_ready) begin
+            dc_l    <= d_coarse;
+            fa_l    <= fine_a;
+            fb_l    <= fine_b;
+            va_l    <= valid_a;
+            vb_l    <= valid_b;
+            ph_l    <= ps_phase_idx;
+            seq_l   <= seq_cnt;
+            seq_cnt <= seq_cnt + 1'b1;
         end
     end
 
     // -------------------------------------------------------------------------
-    // UART framing FSM: 0xAA, fine_a, fine_b, d_coarse[7:0], {vb,va,d[13:8]}
+    // UART framing -- 8 bytes, shifted out of a snapshot register.
+    //
+    //   byte0 : 0xA5                                       sync header
+    //   byte1 : fine_a[7:0]
+    //   byte2 : fine_b[7:0]
+    //   byte3 : d_coarse[7:0]
+    //   byte4 : {d_coarse[13:8], fine_a[8], fine_b[8]}
+    //   byte5 : phase_idx[7:0]
+    //   byte6 : {2'b00, valid_b, valid_a, phase_idx[11:8]}
+    //   byte7 : seq[7:0]
+    //
+    // Header is 0xA5, NOT the old 0xAA. The previous 6-byte frame was parsed by
+    // a host that expected 5 bytes; it stayed in sync by luck and silently
+    // mis-decoded every field. Changing the header makes an out-of-date host
+    // fail loudly instead of quietly reporting wrong numbers.
+    //
+    // WHY A SHIFT REGISTER AND NOT A BYTE-PER-STATE FSM
+    // The whole frame is snapshotted into `sr` at load time. A measurement that
+    // completes mid-transmission overwrites the *_l latches but CANNOT corrupt
+    // the frame already in flight. The old per-state FSM read the latches live
+    // on each byte, so a record landing mid-frame produced a torn frame
+    // stitched from two measurements -- invisible on the wire, and indisting-
+    // uishable from a real sample on the host.
     // -------------------------------------------------------------------------
     wire       uart_busy;
     reg        uart_send;
     reg [7:0]  uart_byte;
-    reg [2:0]  fstate;
     reg        pending;
-    reg        frame_done;      // pulses when the last byte has been handed off
+    reg        frame_done;
+    reg [63:0] sr;
+    reg [3:0]  nleft;
 
-    localparam F_IDLE=3'd0, F_B0=3'd1, F_B1=3'd2, F_B2=3'd3,
-               F_B3=3'd4,   F_B4=3'd5, F_B5=3'd6;
+    wire [63:0] frame_w = { 8'hA5,
+                            fa_l[7:0],
+                            fb_l[7:0],
+                            dc_l[7:0],
+                            {dc_l[13:8], fa_l[8], fb_l[8]},
+                            ph_l[7:0],
+                            {2'b00, vb_l, va_l, ph_l[11:8]},
+                            seq_l };
 
     always @(posedge clk200) begin
         if (rst200) begin
-            fstate <= F_IDLE; uart_send <= 1'b0; uart_byte <= 8'h00;
-            pending <= 1'b0;  frame_done <= 1'b0;
+            uart_send <= 1'b0; uart_byte <= 8'h00; pending <= 1'b0;
+            frame_done <= 1'b0; sr <= 64'd0; nleft <= 4'd0;
         end else begin
             uart_send  <= 1'b0;
             frame_done <= 1'b0;
 
             if (meas_ready) pending <= 1'b1;
 
-            case (fstate)
-                F_IDLE: if (pending && !uart_busy) begin
-                            pending   <= 1'b0;
-                            uart_byte <= 8'hAA;
-                            uart_send <= 1'b1;
-                            fstate    <= F_B0;
-                        end
-                F_B0: if (!uart_busy && !uart_send) begin
-                            uart_byte <= fa_l[7:0];            uart_send <= 1'b1; fstate <= F_B1; end
-                F_B1: if (!uart_busy && !uart_send) begin
-                            uart_byte <= fb_l[7:0];            uart_send <= 1'b1; fstate <= F_B2; end
-                F_B2: if (!uart_busy && !uart_send) begin
-                            uart_byte <= dc_l[7:0];            uart_send <= 1'b1; fstate <= F_B3; end
-                F_B3: if (!uart_busy && !uart_send) begin
-                            uart_byte <= {fb_l[8], fa_l[8], dc_l[13:8]};
-                                                               uart_send <= 1'b1; fstate <= F_B4; end
-                F_B4: if (!uart_busy && !uart_send) begin
-                            uart_byte <= {6'b000000, vb_l, va_l};
-                                                               uart_send <= 1'b1; fstate <= F_B5; end
-                F_B5: if (!uart_busy && !uart_send) begin
-                            frame_done <= 1'b1;                                   fstate <= F_IDLE; end
-                default: fstate <= F_IDLE;
-            endcase
+            if (nleft == 4'd0) begin
+                if (pending && !uart_busy && !uart_send) begin
+                    pending   <= 1'b0;
+                    uart_byte <= frame_w[63:56];   // header out now
+                    sr        <= {frame_w[55:0], 8'h00};
+                    uart_send <= 1'b1;
+                    nleft     <= 4'd7;             // 7 payload bytes still to go
+                end
+            end else if (!uart_busy && !uart_send) begin
+                uart_byte <= sr[63:56];
+                sr        <= {sr[55:0], 8'h00};
+                uart_send <= 1'b1;
+                nleft     <= nleft - 1'b1;
+                if (nleft == 4'd1) frame_done <= 1'b1;
+            end
         end
     end
 
@@ -181,6 +280,122 @@ module tdc_dual_board #(
         .clk (clk200), .rst (rst200), .send (uart_send), .data (uart_byte),
         .tx  (uart_txd), .busy (uart_busy)
     );
+
+    // -------------------------------------------------------------------------
+    // AUTONOMOUS DPS SWEEP
+    //
+    //   COLLECT : let SAMPLES_PER_STEP measurements complete at the current
+    //             phase, then request a step.
+    //   STEP    : one-cycle step request into dps_phase_ctrl.
+    //   SETTLE  : wait for the PS handshake to finish (ps_busy low), then a
+    //             fixed settle window, then collect again.
+    //
+    // Re-arm is BLOCKED outside COLLECT. A measurement taken while the shift is
+    // in flight would be tagged with the new phase_idx (which updates the
+    // instant the step is requested) but physically sampled at the old phase.
+    // Those samples are not merely noisy -- they are mislabelled, and they land
+    // in the wrong histogram bin where nothing distinguishes them from good
+    // data. Blocking re-arm means they are never taken at all.
+    //
+    // TRIANGLE, NOT SAWTOOTH: the phase walks 0 -> SWEEP_STEPS-1 -> 0 -> ...
+    // Returning by stepping back down costs nothing and buys a free
+    // consistency check: the up-sweep and the down-sweep must agree. If they
+    // do not, that is MMCM fine-phase-shift hysteresis, which is a real effect
+    // and one that a sawtooth-plus-reset sweep would hide completely.
+    // Interior phases are visited twice per traversal and the two endpoints
+    // once; the host normalises by the actual sample count per phase, so this
+    // asymmetry does not bias anything.
+    // -------------------------------------------------------------------------
+    localparam integer SW_CNT_W  = $clog2(SAMPLES_PER_STEP + 1);
+    localparam integer SW_PH_W   = $clog2(SWEEP_STEPS + 1);
+    localparam integer SW_SET_W  = $clog2(SETTLE_CYCLES + 1);
+
+    localparam SW_COLLECT = 2'd0, SW_STEP = 2'd1, SW_SETTLE = 2'd2;
+
+    reg [1:0]           sw_state;
+    reg [SW_CNT_W-1:0]  sw_count;
+    reg [SW_PH_W-1:0]   sw_phase;    // local mirror, for wrap control only
+    reg [SW_SET_W-1:0]  sw_settle;
+    reg                 sw_mismatch; // sticky: local mirror != ps_phase_idx
+
+    wire sweep_on   = (AUTO_SWEEP != 0) && sw_autorearm;
+    wire sweep_hold = sweep_on && (sw_state != SW_COLLECT);
+
+    always @(posedge clk200) begin
+        if (rst200) begin
+            sw_state       <= SW_COLLECT;
+            sw_count       <= 0;
+            sw_phase       <= 0;
+            sw_settle      <= 0;
+            sweep_step_req <= 1'b0;
+            sweep_dir      <= 1'b0;      // 0 = increment
+            sweep_dir_q    <= 1'b0;
+            sw_mismatch    <= 1'b0;
+        end else begin
+            sweep_step_req <= 1'b0;      // single-cycle request
+
+            if (!sweep_on) begin
+                sw_state <= SW_COLLECT;
+                sw_count <= 0;
+            end else begin
+                case (sw_state)
+
+                SW_COLLECT: begin
+                    if (meas_ready) begin
+                        if (sw_count >= SAMPLES_PER_STEP[SW_CNT_W-1:0] - 1'b1)
+                            sw_state <= SW_STEP;
+                        else
+                            sw_count <= sw_count + 1'b1;
+                    end
+                end
+
+                SW_STEP: begin
+                    sweep_step_req <= 1'b1;
+                    // Present the direction that is current NOW, not the one
+                    // sweep_dir is about to become. Both are non-blocking, so
+                    // handing dps_phase_ctrl `sweep_dir` directly makes the
+                    // turnaround step arrive with the direction ALREADY
+                    // flipped: the step that should climb to the top of the
+                    // range instead descends, and the phase index silently
+                    // diverges from the sweep position by two counts at every
+                    // reversal.
+                    sweep_dir_q    <= sweep_dir;
+                    sw_count       <= 0;
+                    sw_settle      <= 0;
+                    if (!sweep_dir) begin                 // walking up
+                        sw_phase <= sw_phase + 1'b1;
+                        if (sw_phase + 1'b1 >= SWEEP_STEPS[SW_PH_W-1:0] - 1'b1)
+                            sweep_dir <= 1'b1;            // turn around at the top
+                    end else begin                        // walking down
+                        sw_phase <= sw_phase - 1'b1;
+                        if (sw_phase <= 1)
+                            sweep_dir <= 1'b0;            // turn around at zero
+                    end
+                    sw_state <= SW_SETTLE;
+                end
+
+                SW_SETTLE: begin
+                    if (!ps_busy) begin
+                        if (sw_settle >= SETTLE_CYCLES[SW_SET_W-1:0] - 1'b1) begin
+                            // The frame carries ps_phase_idx, not sw_phase. They
+                            // must agree; if they ever do not, a step was lost
+                            // or spuriously applied and every subsequent phase
+                            // label in the run is shifted. Latch it so the run
+                            // can be thrown away rather than quietly believed.
+                            if (ps_phase_idx != {{(PHASE_BITS-SW_PH_W){1'b0}}, sw_phase})
+                                sw_mismatch <= 1'b1;
+                            sw_state <= SW_COLLECT;
+                        end else begin
+                            sw_settle <= sw_settle + 1'b1;
+                        end
+                    end
+                end
+
+                default: sw_state <= SW_COLLECT;
+                endcase
+            end
+        end
+    end
 
     // -------------------------------------------------------------------------
     // Re-arm. Manual (btn_clear) OR automatic once the frame is out.
@@ -192,7 +407,7 @@ module tdc_dual_board #(
     reg [2:0] rearm_cnt;
     always @(posedge clk200) begin
         if (rst200)                          rearm_cnt <= 3'd0;
-        else if (sw_autorearm && frame_done) rearm_cnt <= 3'd4;
+        else if (sw_autorearm && frame_done && !sweep_hold) rearm_cnt <= 3'd4;
         else if (rearm_cnt != 3'd0)          rearm_cnt <= rearm_cnt - 1'b1;
     end
 
@@ -234,7 +449,10 @@ module tdc_dual_board #(
     assign led[4]    = va_led;           // last START code was a legal thermometer
     assign led[5]    = vb_led;           // last STOP  code was a legal thermometer
     assign led[6]    = tmo_led;          // STOP never arrived
-    assign led[7]    = 1'b0;
+    // led[7] : sweep integrity. Solid = a step was lost (sw_mismatch) or a
+    // PSDONE was missed (ps_error). Either way the phase labels in this run
+    // cannot be trusted -- do not build a LUT from it.
+    assign led[7]    = sw_mismatch | ps_error;
     assign led[15:8] = meas_cnt;         // measurement counter
 
 endmodule

@@ -19,6 +19,8 @@
 
 (* KEEP_HIERARCHY = "TRUE" *)
 module single_tdl #(
+    // TAP_SRC 0 = CO outputs (normal). 1 = O outputs (XORCY probe build).
+    parameter TAP_SRC = 0,
     parameter NUM_CARRY4 = 64
 )(
     // -------------------------------------------------------------------------
@@ -53,7 +55,74 @@ module single_tdl #(
     wire [(4*NUM_CARRY4)-1:0] unused_sum;
 
     // Export thermometer code.
-    assign taps = tdl_taps_raw;
+    // -------------------------------------------------------------------------
+    // TAP_SRC = 1 : XORCY PROBE BUILD. Diagnostic only, do not ship.
+    //
+    // With S = 4'b1111 the CARRY4 sum output is O[j] = 1 XOR ci_j = ~ci_j, so
+    // ~O[k] is the carry-chain node ONE POSITION EARLIER than CO[k], seen
+    // through one XORCY:
+    //
+    //     T( ~O[k] )  =  T( CO[k-1] )  +  t_XORCY
+    //
+    // t_XORCY is the ONLY thing that decides whether tapping O as well as CO
+    // is worth anything. If it lands mid-bin, 704 interleaved taps roughly
+    // halve the quantisation error. If it lands near a whole tap, the O taps
+    // sit on top of existing CO taps and the entire 352->704 rebuild buys
+    // nothing. Nobody has measured it, so measure it before committing.
+    //
+    // Build this, run the SAME sweep and analyser, then difference the LUTs:
+    //     t_XORCY = lut_probe[k] - lut_normal[k-1]
+    // Everything else -- width, encoder, frame, host, placement -- is
+    // unchanged, so the two runs are directly comparable.
+    // -------------------------------------------------------------------------
+    generate
+    if (TAP_SRC == 0) begin : g_co
+        assign taps = tdl_taps_raw;
+    end
+    else if (TAP_SRC == 1) begin : g_o_only
+        // Diagnostic only. Measures the O chain in isolation, which CANNOT
+        // determine t_XORCY: comparing it against a separate CO build leaves an
+        // unknown per-bitstream offset inseparable from t_XORCY itself.
+        assign taps = ~unused_sum;
+    end
+    else begin : g_interleave
+        // ---------------------------------------------------------------------
+        // TAP_SRC = 2 : INTERLEAVED PROBE -- the build that answers the question.
+        //
+        // With S = 4'b1111 the sum output is O[k] = 1 XOR ci_k = ~ci_k, so
+        //     T( ~O[k+1] ) = T( CO[k] ) + t_XORCY
+        // The O tap sits INSIDE the bin between CO[k] and CO[k+1], provided
+        // t_XORCY is smaller than that bin. Interleaving puts both tap families
+        // into ONE measurement, so their relative spacing appears directly as
+        // the bin-width distribution -- no cross-bitstream offset to cancel,
+        // which is precisely what an O-only build cannot escape.
+        //
+        //     taps[2k]   = CO[k]        k = 0 .. 175
+        //     taps[2k+1] = ~O[k+1]      lands t_XORCY later
+        //
+        // Still 352 taps, so TDL_WIDTH, the encoder, the frame, the host and
+        // tdl_loc.xdc are ALL unchanged. Only CARRY4 blocks 0..44 are read; the
+        // rest stay placed and constrained but unused.
+        //
+        // COST: the chain spans ~176 carry stages ~= 3.0 ns, not 5.0 ns, so any
+        // phase needing more than 3 ns of propagation rails at 352 -- expect
+        // ~40 % of phases railed. That is EXPECTED. The remaining ~170 phase
+        // steps still give full statistics on all 352 interleaved taps, which
+        // is all this measurement needs.
+        //
+        // READING THE RESULT (analyze_sweep.py, usable region):
+        //   even/odd ratio near 1, mean bin ~8.5 ps -> t_XORCY splits the wide
+        //       bins. Interleaving is worth the 704-tap rebuild (~2x better).
+        //   even/odd still 5-6x, half the bins zero-width -> the O taps land on
+        //       top of the CO taps. Interleaving buys NOTHING. Drop it for good.
+        // ---------------------------------------------------------------------
+        genvar t;
+        for (t = 0; t < (4*NUM_CARRY4)/2; t = t + 1) begin : tap_mux
+            assign taps[2*t]     =  tdl_taps_raw[t];
+            assign taps[2*t + 1] = ~unused_sum[t + 1];
+        end
+    end
+    endgenerate
 
     // -------------------------------------------------------------------------
     // CARRY4 Chain

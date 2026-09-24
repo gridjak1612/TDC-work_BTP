@@ -45,12 +45,16 @@ module tdc_dual_top #(
     parameter integer COARSE_BITS  = 14,
     parameter integer CAPTURE_LAG  = 4,
     parameter integer FINE_LATENCY = 12,
+    parameter integer CAL_EVENT  = 0,     // 1 = drive BOTH chains from clk_cal (calibration)
+    parameter integer PHASE_BITS = 12,
     // How long the pairing FSM waits for the STOP before declaring "no echo".
     // Default = one full coarse rollover (16384 cyc = 81.92 us): beyond that a
     // d_coarse cannot be disambiguated anyway.
     // OVERRIDE THIS TO A SMALL VALUE IN SIMULATION -- at the default, the
     // timeout test alone is 82 us of simulated time and dominates the runtime.
-    parameter integer TIMEOUT_CYCLES = (1 << COARSE_BITS)
+    parameter integer TIMEOUT_CYCLES = (1 << COARSE_BITS),
+    parameter integer TAP_SRC        = 0,    // 1 = XORCY probe build
+    parameter integer SYNC_TAP       = 30    // 0 = old raw-event sync
 )(
     input  wire                   clk100,
     input  wire                   rst,
@@ -58,6 +62,14 @@ module tdc_dual_top #(
     input  wire                   event_a,       // START (async)
     input  wire                   event_b,       // STOP  (async)
     input  wire                   clear_status,  // re-arm both channels
+    input  wire                   ps_step_btn,   // async, calibration build only
+    input  wire                    ps_dir_btn,    // async, calibration build only
+    input  wire                    ps_step_req,   // SYNC 1-cycle, from sweep FSM
+    input  wire                    ps_dir_req,    // SYNC level, 1 = decrement
+    output wire [PHASE_BITS-1:0]   ps_phase_idx,  // signed running phase index
+    output wire                    ps_busy,
+    output wire                    ps_error,      // sticky: a PSDONE was missed
+    output wire                    clk_cal ,       // 25 MHz cal clock (for ILA/observation)
 
     output wire [COARSE_BITS-1:0] d_coarse,
     output wire [FINE_BITS-1:0]   fine_a,
@@ -73,16 +85,71 @@ module tdc_dual_top #(
     output wire                   mmcm_locked
 );
 
-    wire clk200_i, mmcm_locked_i;
+    wire clk200_i, clk_cal_i, mmcm_locked_i;
+    wire psen_i, psincdec_i, psdone_i;
 
     clk_wiz_0 clk_gen (
-        .clk_in1 (clk100),
-        .clk_out1(clk200_i),
-        .reset   (rst),
-        .locked  (mmcm_locked_i)
+        .clk_in1  (clk100),
+        .clk_out1 (clk200_i),
+        .clk_out2 (clk_cal_i),
+        .psclk    (clk200_i),     // PS interface clocked by the 200 MHz domain
+        .psen     (psen_i),
+        .psincdec (psincdec_i),
+        .psdone   (psdone_i),
+        .reset    (rst),
+        .locked   (mmcm_locked_i)
     );
+    assign clk_cal = clk_cal_i;
 
     wire rst_i = rst | ~mmcm_locked_i;
+        // Calibration event injection: constant-folds, so nothing enters the launch
+    // net at runtime -- same discipline as EVENT_SRC. Both chains tied to the
+    // SAME cal edge, so one sweep yields independent START and STOP histograms.
+    wire event_a_i, event_b_i;
+    generate
+        if (CAL_EVENT != 0) begin : g_cal
+            assign event_a_i = clk_cal_i;
+            assign event_b_i = clk_cal_i;
+        end else begin : g_norm
+            assign event_a_i = event_a;
+            assign event_b_i = event_b;
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Dynamic phase shift -- CALIBRATION BUILDS ONLY.
+    //
+    // This used to be instantiated unconditionally, with ps_step_btn wired to
+    // btn_a at the board level. In an EVENT_SRC=0 build btn_a is the START
+    // event, so every manual START also stepped the MMCM phase: the sampler
+    // walked out from under the measurement, silently, with nothing in the
+    // data to show it. Guarding on CAL_EVENT makes the two roles mutually
+    // exclusive by construction instead of by remembering.
+    // -------------------------------------------------------------------------
+    generate
+    if (CAL_EVENT != 0) begin : g_dps
+        dps_phase_ctrl #(.PHASE_BITS(PHASE_BITS)) dps_ctrl_inst (
+            .psclk     (clk200_i),
+            .rst       (rst_i),
+            .step_btn  (ps_step_btn),
+            .dir_btn   (ps_dir_btn),
+            .step_req  (ps_step_req),
+            .dir_req   (ps_dir_req),
+            .psdone    (psdone_i),
+            .psen      (psen_i),
+            .psincdec  (psincdec_i),
+            .phase_idx (ps_phase_idx),
+            .busy      (ps_busy),
+            .ps_error  (ps_error)
+        );
+    end else begin : g_no_dps
+        assign psen_i       = 1'b0;
+        assign psincdec_i   = 1'b0;
+        assign ps_phase_idx = {PHASE_BITS{1'b0}};
+        assign ps_busy      = 1'b0;
+        assign ps_error     = 1'b0;
+    end
+    endgenerate
 
     assign clk200      = clk200_i;
     assign mmcm_locked = mmcm_locked_i;
@@ -107,19 +174,20 @@ module tdc_dual_top #(
 
     tdc_channel #(
         .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
-        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG),
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP),
         .FINE_LATENCY(FINE_LATENCY)
     ) chan_a (
         .clk          (clk200_i),
         .rst          (rst_i),
-        .event_in     (event_a),
+        
         .clear_status (clear_status),
         .coarse_count (coarse_count),
         .coarse_out   (coarse_a_w),
         .fine_out     (fine_a_w),
         .valid_out    (valid_a_w),
         .ready        (ready_a_w),
-        .done         (done_a)
+        .done         (done_a),
+        .event_in     (event_a_i)
     );
 
     // -------------------------------------------------------------------------
@@ -131,18 +199,19 @@ module tdc_dual_top #(
 
     tdc_channel #(
         .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
-        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG),
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP),
         .FINE_LATENCY(FINE_LATENCY)
     ) chan_b (
         .clk          (clk200_i),
         .rst          (rst_i),
-        .event_in     (event_b),
+        
         .clear_status (clear_status),
         .coarse_count (coarse_count),
         .coarse_out   (coarse_b_w),
         .fine_out     (fine_b_w),
         .valid_out    (valid_b_w),
         .ready        (ready_b_w),
+        .event_in     (event_b_i),
         .done         (done_b)
     );
 
