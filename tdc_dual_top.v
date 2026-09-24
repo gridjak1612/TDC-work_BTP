@@ -33,8 +33,8 @@
 //   phase. Both events keep their picosecond fine information.
 //
 //   The host computes:
-//       interval = d_coarse * 5.000 ns  -  (tau_b[fine_b] - tau_a[fine_a])
-//   using a PER-CHANNEL calibration LUT, because tau_a != tau_b.
+//       interval = d_coarse * 5.000 ns  +  (t_b[fine_b] - t_a[fine_a])
+//   using a PER-CHANNEL calibration LUT (t = calibrated arrival phase).
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -45,16 +45,15 @@ module tdc_dual_top #(
     parameter integer COARSE_BITS  = 14,
     parameter integer CAPTURE_LAG  = 4,
     parameter integer FINE_LATENCY = 12,
-    parameter integer CAL_EVENT  = 0,     // 1 = drive BOTH chains from clk_cal (calibration)
+    parameter integer CAL_EVENT  = 0,     // 1 = DPS controller built; drives both chains from clk_cal unless EVENT_MUX
+    parameter integer EVENT_MUX  = 0,     // 1 = run-time select: use_cal ? clk_cal : event_a/event_b
     parameter integer PHASE_BITS = 12,
-    // How long the pairing FSM waits for the STOP before declaring "no echo".
-    // Default = one full coarse rollover (16384 cyc = 81.92 us): beyond that a
-    // d_coarse cannot be disambiguated anyway.
-    // OVERRIDE THIS TO A SMALL VALUE IN SIMULATION -- at the default, the
-    // timeout test alone is 82 us of simulated time and dominates the runtime.
+    // How long the pairing FSM waits for the second channel before declaring
+    // a timeout. Default = one full coarse rollover (16384 cyc = 81.92 us).
+    // OVERRIDE THIS TO A SMALL VALUE IN SIMULATION.
     parameter integer TIMEOUT_CYCLES = (1 << COARSE_BITS),
     parameter integer TAP_SRC        = 0,    // 1 = XORCY probe build
-    parameter integer SYNC_TAP       = 30,    // 0 = old raw-event sync
+    parameter integer SYNC_TAP       = 30,   // 0 = old raw-event sync
     parameter integer DUAL_SNAP      = 1     // step 4 dead-zone fix
 )(
     input  wire                   clk100,
@@ -62,15 +61,16 @@ module tdc_dual_top #(
 
     input  wire                   event_a,       // START (async)
     input  wire                   event_b,       // STOP  (async)
+    input  wire                   use_cal,       // EVENT_MUX builds: 1 = both chains from clk_cal
     input  wire                   clear_status,  // re-arm both channels
-    input  wire                   ps_step_btn,   // async, calibration build only
-    input  wire                    ps_dir_btn,    // async, calibration build only
-    input  wire                    ps_step_req,   // SYNC 1-cycle, from sweep FSM
-    input  wire                    ps_dir_req,    // SYNC level, 1 = decrement
-    output wire [PHASE_BITS-1:0]   ps_phase_idx,  // signed running phase index
-    output wire                    ps_busy,
-    output wire                    ps_error,      // sticky: a PSDONE was missed
-    output wire                    clk_cal ,       // 25 MHz cal clock (for ILA/observation)
+    input  wire                   ps_step_btn,   // async, calibration builds only
+    input  wire                   ps_dir_btn,    // async, calibration builds only
+    input  wire                   ps_step_req,   // SYNC 1-cycle, from sweep FSM
+    input  wire                   ps_dir_req,    // SYNC level, 1 = decrement
+    output wire [PHASE_BITS-1:0]  ps_phase_idx,  // signed running phase index
+    output wire                   ps_busy,
+    output wire                   ps_error,      // sticky: a PSDONE was missed
+    output wire                   clk_cal,       // 25 MHz cal clock
 
     output wire [COARSE_BITS-1:0] d_coarse,
     output wire [FINE_BITS-1:0]   fine_a,
@@ -83,7 +83,8 @@ module tdc_dual_top #(
     output wire                   done_a,
     output wire                   done_b,
     output wire                   clk200,
-    output wire                   mmcm_locked
+    output wire                   mmcm_locked,
+    output wire                   rst_sync       // synchronised reset, clk200 domain
 );
 
     wire clk200_i, clk_cal_i, mmcm_locked_i;
@@ -102,13 +103,43 @@ module tdc_dual_top #(
     );
     assign clk_cal = clk_cal_i;
 
-    wire rst_i = rst | ~mmcm_locked_i;
-        // Calibration event injection: constant-folds, so nothing enters the launch
-    // net at runtime -- same discipline as EVENT_SRC. Both chains tied to the
-    // SAME cal edge, so one sweep yields independent START and STOP histograms.
+    // -------------------------------------------------------------------------
+    // Reset synchroniser.
+    //   Asserts IMMEDIATELY (asynchronously) on the reset button or on MMCM
+    //   loss of lock, releases SYNCHRONOUSLY two clk200 edges after both causes
+    //   are gone, and reaches the design from a FLIP-FLOP.
+    //   The old `rst | ~mmcm_locked` was a LUT driving the capture controllers'
+    //   asynchronous clears directly (DRC LUTAR-1): a glitch on it could reset
+    //   a channel in the middle of a measurement.
+    // -------------------------------------------------------------------------
+    (* ASYNC_REG = "TRUE" *) reg [1:0] rs_btn = 2'b11;
+    (* ASYNC_REG = "TRUE" *) reg [1:0] rs_lck = 2'b11;
+    always @(posedge clk200_i or posedge rst)
+        if (rst) rs_btn <= 2'b11;
+        else     rs_btn <= {rs_btn[0], 1'b0};
+    always @(posedge clk200_i or negedge mmcm_locked_i)
+        if (!mmcm_locked_i) rs_lck <= 2'b11;
+        else                rs_lck <= {rs_lck[0], 1'b0};
+    reg rst_q = 1'b1;
+    always @(posedge clk200_i) rst_q <= rs_btn[1] | rs_lck[1];
+    wire rst_i = rst_q;
+    assign rst_sync = rst_q;
+
+    // -------------------------------------------------------------------------
+    // Event routing into the two chains.
+    // -------------------------------------------------------------------------
     wire event_a_i, event_b_i;
     generate
-        if (CAL_EVENT != 0) begin : g_cal
+        if (EVENT_MUX != 0) begin : g_mux
+            // Run-time source select (board EVENT_SRC = 4). One LUT per chain in
+            // front of CYINIT, shared by every source: it adds a constant delay
+            // per source (removed by calibration) and does not change the bins,
+            // which belong to the carry chain. The select is static during a
+            // run; its timing path is cut in ro_multi.xdc.
+            assign event_a_i = use_cal ? clk_cal_i : event_a;
+            assign event_b_i = use_cal ? clk_cal_i : event_b;
+        end else if (CAL_EVENT != 0) begin : g_cal
+            // Dedicated calibration build: constant-folds, no LUT in the path.
             assign event_a_i = clk_cal_i;
             assign event_b_i = clk_cal_i;
         end else begin : g_norm
@@ -118,14 +149,9 @@ module tdc_dual_top #(
     endgenerate
 
     // -------------------------------------------------------------------------
-    // Dynamic phase shift -- CALIBRATION BUILDS ONLY.
-    //
-    // This used to be instantiated unconditionally, with ps_step_btn wired to
-    // btn_a at the board level. In an EVENT_SRC=0 build btn_a is the START
-    // event, so every manual START also stepped the MMCM phase: the sampler
-    // walked out from under the measurement, silently, with nothing in the
-    // data to show it. Guarding on CAL_EVENT makes the two roles mutually
-    // exclusive by construction instead of by remembering.
+    // Dynamic phase shift -- only in builds with CAL_EVENT.
+    // Guarding on CAL_EVENT keeps btn_a from stepping the MMCM in a button
+    // build, where btn_a is the START event.
     // -------------------------------------------------------------------------
     generate
     if (CAL_EVENT != 0) begin : g_dps
@@ -180,7 +206,6 @@ module tdc_dual_top #(
     ) chan_a (
         .clk          (clk200_i),
         .rst          (rst_i),
-        
         .clear_status (clear_status),
         .coarse_count (coarse_count),
         .coarse_out   (coarse_a_w),
@@ -205,7 +230,6 @@ module tdc_dual_top #(
     ) chan_b (
         .clk          (clk200_i),
         .rst          (rst_i),
-        
         .clear_status (clear_status),
         .coarse_count (coarse_count),
         .coarse_out   (coarse_b_w),

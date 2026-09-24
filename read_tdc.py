@@ -2,7 +2,17 @@
 """
 read_tdc.py -- host reader for the two-channel interval TDC, 9-byte frame.
 
-FRAME (9 bytes, 8N1 @ 2 Mbaud)
+FRAME v4 (10 bytes, 8N1 @ 2 Mbaud)
+
+    byte0    : 0xA7 header
+    byte1..8 : 64-bit payload, MSB first:
+               fine_a[10:0] fine_b[10:0] d_coarse[13:0] phase[11:0]
+               valid_a valid_b seq[7:0] cfg[5:0]
+               cfg = {encoder_id[2:0], dual_snap, source[1:0]}
+               source: 0=ext 1=RO7 2=RO11 3=DPS
+    byte9    : CRC-8 (poly 0x07, init 0) over bytes 0..8
+
+PREVIOUS v3 LAYOUT (9 bytes, header 0xA6), for reference
 
     byte0 : 0xA6                                       sync header
     byte1 : fine_a[7:0]
@@ -59,8 +69,8 @@ import time
 import argparse
 from collections import Counter, defaultdict
 
-FRAME_LEN = 9
-HEADER = 0xA6
+FRAME_LEN = 10
+HEADER = 0xA7
 TDL_TAPS = 352          # 88 CARRY4 x 4. fine ranges 0..352, NOT 0..255.
 T_CLK_NS = 5.000        # 200 MHz sampler
 PHASE_STEP_PS = 1000.0 / 56.0    # MMCM fine step = T_VCO/56, VCO = 1000 MHz
@@ -133,31 +143,33 @@ def crc8(data):
     return c
 
 
-def pack(fine_a, fine_b, d_coarse, valid_a, valid_b, phase, seq):
-    """Inverse of unpack(); mirrors frame_w + CRC. Used by the self-test."""
-    ph = phase & 0xFFF
-    b = bytes([HEADER, fine_a & 0xFF, fine_b & 0xFF, d_coarse & 0xFF,
-               ((d_coarse >> 8) << 2) | ((fine_a >> 8) << 1) | (fine_b >> 8),
-               ph & 0xFF, (valid_b << 5) | (valid_a << 4) | (ph >> 8), seq & 0xFF])
+def pack(fine_a, fine_b, d_coarse, valid_a, valid_b, phase, seq, cfg=0):
+    """Inverse of unpack(); mirrors the v4 payload in tdc_dual_board.v."""
+    p = (((fine_a & 0x7FF) << 53) | ((fine_b & 0x7FF) << 42) |
+         ((d_coarse & 0x3FFF) << 28) | ((phase & 0xFFF) << 16) |
+         ((valid_a & 1) << 15) | ((valid_b & 1) << 14) |
+         ((seq & 0xFF) << 6) | (cfg & 0x3F))
+    b = bytes([HEADER]) + p.to_bytes(8, 'big')
     return b + bytes([crc8(b)])
 
 
+SRC_NAMES = {0: 'ext', 1: 'ro7', 2: 'ro11', 3: 'dps'}
+
+
 def unpack(f):
-    """Decode one 9-byte frame. Mirrors frame_w in tdc_dual_board.v."""
+    """Decode one 10-byte v4 frame. Mirrors the payload in tdc_dual_board.v."""
     if len(f) != FRAME_LEN or f[0] != HEADER:
         raise ValueError("not a frame")
-    if crc8(f[:8]) != f[8]:
+    if crc8(f[:FRAME_LEN - 1]) != f[FRAME_LEN - 1]:
         raise ValueError("crc")
-    fine_a = (((f[4] >> 1) & 1) << 8) | f[1]
-    fine_b = ((f[4] & 1) << 8) | f[2]
-    d_coarse = ((f[4] >> 2) << 8) | f[3]
-    phase_u = ((f[6] & 0x0F) << 8) | f[5]
-    phase = phase_u - 4096 if (phase_u & 0x800) else phase_u   # sign-extend 12b
-    valid_a = (f[6] >> 4) & 1
-    valid_b = (f[6] >> 5) & 1
-    seq = f[7]
-    return dict(fine_a=fine_a, fine_b=fine_b, d_coarse=d_coarse,
-                phase=phase, valid_a=valid_a, valid_b=valid_b, seq=seq)
+    p = int.from_bytes(f[1:9], 'big')
+    phase_u = (p >> 16) & 0xFFF
+    cfg = p & 0x3F
+    return dict(fine_a=(p >> 53) & 0x7FF, fine_b=(p >> 42) & 0x7FF,
+                d_coarse=(p >> 28) & 0x3FFF,
+                phase=phase_u - 4096 if phase_u & 0x800 else phase_u,
+                valid_a=(p >> 15) & 1, valid_b=(p >> 14) & 1,
+                seq=(p >> 6) & 0xFF, cfg=cfg, src=cfg & 3)
 
 
 class Framer:
@@ -193,7 +205,7 @@ class Framer:
                 self._lose_lock()
                 continue
             frame = bytes(self.buf[:FRAME_LEN])
-            if crc8(frame[:8]) != frame[8]:
+            if crc8(frame[:FRAME_LEN - 1]) != frame[FRAME_LEN - 1]:
                 if self.locked:
                     self.crc_errors += 1
                 del self.buf[0]
@@ -292,52 +304,32 @@ def _mean(counter):
 # Self-test -- runs without hardware, checks against RTL-generated vectors
 # ---------------------------------------------------------------------------
 
-# Payload vectors (bytes 1..7) were produced by the RTL frame_w expression; the
-# payload layout is unchanged, so they still pin the field packing.
 VECTORS = [
-    # fine_a fine_b d_coarse va vb phase seq   payload bytes 1..7
-    ((0,     0,     0,       0, 0, 0,     0),   "00 00 00 00 00 00 00"),
-    ((1,     2,     3,       1, 1, 1,     1),   "01 02 03 00 01 30 01"),
-    ((351,   352,   16383,   1, 0, 279,   200), "5f 60 ff ff 17 11 c8"),
-    ((300,   260,   1234,    0, 1, -1,    255), "2c 04 d2 13 ff 2f ff"),
-    ((256,   255,   8192,    1, 1, -280,  77),  "00 ff 00 82 e8 3e 4d"),
-    ((128,   64,    0,       1, 1, -2048, 1),   "80 40 00 00 00 38 01"),
-    ((511,   511,   16383,   1, 1, 2047,  254), "ff ff ff ff ff 37 fe"),
-]
-
-# Whole frames captured from the RTL in simulation (tb_ro_cd.v): Python crc8()
-# must agree with the Verilog crc8_64() byte for byte.
-RTL_FRAMES = [
-    "a6 c2 c2 00 00 00 30 00 fc",
-    "a6 0c 0c 00 03 00 30 01 0b",
-    "a6 e8 e8 00 00 00 30 02 26",
+    # fine_a fine_b d_coarse va vb phase  seq  cfg
+    (0,    0,    0,     0, 0, 0,     0,   0),
+    (1,    2,    3,     1, 1, 1,     1,   1),
+    (351,  352,  16383, 1, 0, 279,   200, 2),
+    (300,  260,  1234,  0, 1, -1,    255, 3),
+    (2047, 1024, 8192,  1, 1, -280,  77,  5),
+    (598,  601,  1,     1, 1, -2048, 1,   63),
+    (2047, 2047, 16383, 1, 1, 2047,  254, 42),
 ]
 
 
 def selftest():
     bad = 0
-    for (fa, fb, dc, va, vb, ph, sq), hexs in VECTORS:
-        payload = bytes(int(x, 16) for x in hexs.split())
-        f = bytes([HEADER]) + payload
-        f = f + bytes([crc8(f)])
-        r = unpack(f)
-        want = dict(fine_a=fa, fine_b=fb, d_coarse=dc,
-                    valid_a=va, valid_b=vb, phase=ph, seq=sq)
-        if r != want or pack(fa, fb, dc, va, vb, ph, sq) != f:
+    for v in VECTORS:
+        fa, fb, dc, va, vb, ph, sq, cfg = v
+        r = unpack(pack(*v))
+        want = dict(fine_a=fa, fine_b=fb, d_coarse=dc, phase=ph, valid_a=va,
+                    valid_b=vb, seq=sq, cfg=cfg, src=cfg & 3)
+        if r != want:
             bad += 1
-            print(f"  MISMATCH {hexs}: got {r}")
-    print(f"pack/unpack : {len(VECTORS) - bad}/{len(VECTORS)} RTL payload vectors")
+            print(f"  MISMATCH {v}: got {r}")
+    print(f"pack/unpack : {len(VECTORS) - bad}/{len(VECTORS)} v4 round-trips "
+          "(RTL agreement: check_uart_dump.py on simulation output)")
 
-    nbad = 0
-    for h in RTL_FRAMES:
-        f = bytes(int(x, 16) for x in h.split())
-        if crc8(f[:8]) != f[8]:
-            nbad += 1
-            print(f"  CRC MISMATCH vs RTL: {h}")
-    bad += nbad
-    print(f"crc8 vs RTL : {len(RTL_FRAMES) - nbad}/{len(RTL_FRAMES)} frames agree")
-
-    good = b"".join(pack(*v) for v, _ in VECTORS) * 3
+    good = b"".join(pack(*v) for v in VECTORS) * 3
     n_frames = len(VECTORS) * 3
     fr = Framer()
     n_ok = len(fr.feed(good))
@@ -346,17 +338,18 @@ def selftest():
     bad += n_ok != exp
 
     corrupt = bytearray(good)
-    corrupt[9 * 10 + 4] ^= 0x10
+    corrupt[FRAME_LEN * 10 + 4] ^= 0x10
     fr3 = Framer()
     got = fr3.feed(bytes(corrupt))
     print(f"framer      : 1 corrupt frame -> crc_errors={fr3.crc_errors} (expect 1), "
           f"frames {len(got)}")
     bad += fr3.crc_errors != 1
 
-    dropped = good[:9 * 10 + 3] + good[9 * 10 + 4:]
+    dropped = good[:FRAME_LEN * 10 + 3] + good[FRAME_LEN * 10 + 4:]
     fr4 = Framer()
     got4 = fr4.feed(dropped)
-    ok4 = all(r in [unpack(pack(*v)) for v, _ in VECTORS] for r in got4)
+    legal = [unpack(pack(*v)) for v in VECTORS]
+    ok4 = all(r in legal for r in got4)
     print(f"framer      : 1 dropped byte -> only legal frames emitted = {ok4}")
     bad += not ok4
 
@@ -378,7 +371,7 @@ def selftest():
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Two-channel TDC reader, 9-byte CRC frame")
+    p = argparse.ArgumentParser(description="Two-channel TDC reader, v4 10-byte CRC frame")
     p.add_argument("port", nargs="?")
     p.add_argument("--baud", type=int, default=2000000)
     p.add_argument("--out", default="tdc_log.csv")
@@ -411,7 +404,7 @@ def main():
         print("bitstream it was measured on and you will want to recheck.")
 
     ser = serial.Serial(a.port, a.baud, timeout=0.1)
-    print(f"Listening on {a.port} @ {a.baud} 8N1, 9-byte CRC frames. Ctrl-C to stop.")
+    print(f"Listening on {a.port} @ {a.baud} 8N1, v4 10-byte CRC frames. Ctrl-C to stop.")
     print(f"phase step = {PHASE_STEP_PS:.3f} ps, "
           f"{round(T_CLK_NS * 1000 / PHASE_STEP_PS)} steps per {T_CLK_NS} ns period")
     print("-" * 78)
@@ -423,7 +416,7 @@ def main():
     with open(a.out, "w", newline="") as fh:
         w = csv.writer(fh)
         cols = ["seq", "phase", "d_coarse", "fine_a", "fine_b",
-                "valid_a", "valid_b"]
+                "valid_a", "valid_b", "cfg", "src"]
         if lut_a:
             cols.append("interval_ps")
         w.writerow(cols)
@@ -438,7 +431,7 @@ def main():
                     st.add(r)
                     row = [r['seq'], r['phase'], r['d_coarse'],
                            r['fine_a'], r['fine_b'],
-                           r['valid_a'], r['valid_b']]
+                           r['valid_a'], r['valid_b'], r['cfg'], r['src']]
                     if lut_a:
                         iv = interval_ps(r, lut_a, lut_b)
                         row.append("" if iv is None else f"{iv:.2f}")

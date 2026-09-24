@@ -33,9 +33,9 @@ module tb_ro_cd;
     localparam integer FRAMES = 300;
     initial begin
         repeat (40) @(posedge clk100); rst = 0;
-        wait (nbytes >= 9 * FRAMES);
+        wait (nbytes >= 10 * FRAMES);
         $fclose(fh);
-        $display("frames=%0d  led[7]=%0d (must be 0)", nbytes / 9, led[7]);
+        $display("frames=%0d  led[7]=%0d (must be 0)", nbytes / 10, led[7]);
         $finish;
     end
 endmodule

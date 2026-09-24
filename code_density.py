@@ -51,7 +51,8 @@ def load_csv(path):
             rows.append(dict(d_coarse=int(r['d_coarse']),
                              fine_a=int(r['fine_a']), fine_b=int(r['fine_b']),
                              valid_a=int(r['valid_a']), valid_b=int(r['valid_b']),
-                             seq=int(r['seq'])))
+                             seq=int(r['seq']),
+                             src=int(r['src']) if r.get('src') not in (None, '') else -1))
     return rows
 
 
@@ -249,7 +250,11 @@ def main():
     ap.add_argument("--include-invalid", action="store_true",
                     help="count bubble-flagged hits at their ones-count code")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--rail-max", type=int, default=352,
+                    help="rail code meaning chain full (352 for the 88-CARRY4 chain)")
     a = ap.parse_args()
+    global TDL_TAPS
+    TDL_TAPS = a.rail_max
     if a.selftest:
         sys.exit(selftest())
 
@@ -263,6 +268,10 @@ def main():
     seqs = [r['seq'] for r in rows]
     gaps = sum((seqs[i] - seqs[i - 1] - 1) & 0xFF for i in range(1, len(seqs)))
     print(f"{len(rows)} frames, sequence gaps (dropped): {gaps}")
+    srcs = Counter(r.get("src", -1) for r in rows)
+    print("event source(s):", dict(srcs), "(0=ext 1=RO7 2=RO11 3=DPS, -1=pre-v4 capture)")
+    if len(srcs) > 1:
+        print("  WARNING: this capture mixes event sources -- split it before calibrating")
 
     ra = analyse(rows, 0, a)
     rb = analyse(rows, 1, a)

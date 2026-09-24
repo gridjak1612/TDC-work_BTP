@@ -152,7 +152,10 @@ def main():
     ap.add_argument('--cal', required=True)
     ap.add_argument('--eval', required=True)
     ap.add_argument('--out', default='figs')
+    ap.add_argument('--rail-max', type=int, default=352)
     a = ap.parse_args()
+    global RAIL
+    RAIL = (0, a.rail_max)
     r1, r2 = load(a.cal), load(a.eval)
     A, B = chain(r1, r2, 0), chain(r1, r2, 1)
     lb_shift = {}
