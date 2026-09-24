@@ -161,7 +161,9 @@ def tie_offset(rows, lut_a, lut_b):
         if ta is None or tb is None or not (x['valid_a'] and x['valid_b']):
             continue
         dc = x['d_coarse'] - (1 << 14) if x['d_coarse'] >= (1 << 13) else x['d_coarse']
-        r.append(dc * PERIOD_PS + ta - tb)
+        if abs(dc) > 1:
+            continue    # pair spans two different events (edge missed at re-arm)
+        r.append(dc * PERIOD_PS + tb - ta)
     if not r:
         return 0.0, float('nan'), 0
     r.sort()
@@ -279,7 +281,7 @@ def main():
     if a.out_lut:
         print()
         write_lut(f"{a.out_lut}_a.csv", ra)
-        write_lut(f"{a.out_lut}_b.csv", rb, shift=-off)
+        write_lut(f"{a.out_lut}_b.csv", rb, shift=off)
 
 
 if __name__ == "__main__":

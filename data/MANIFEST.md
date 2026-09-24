@@ -18,3 +18,7 @@ location), not recorded at capture time. From now on, record them when capturing
 Name every capture `<date>_<githash>_<desc>.csv`, e.g. `0925_a1b2c3d_sweep_sync30.csv`,
 and add one line here: build params, bitstream hash, temperature if known.
 A LUT is only valid for the bitstream (placement) it was built from.
+| 0924b_f62460d_ro7_sync30.csv | EVENT_SRC=3, RO_STAGES=7, f62460d, 5-min warm-up | 2.97 M frames |
+| 0924b_f62460d_dps_sync30.csv | EVENT_SRC=2 (DPS), f62460d, 5-min warm-up | 1.36 M frames, LED7 off throughout |
+| 0924b_f62460d_ro11_sync30.csv | EVENT_SRC=3, RO_STAGES=11, f62460d, 5-min warm-up | 3.02 M frames |
+| 0924c_e0f33e7_ro7_sync30_ds.csv | step 4 DUAL_SNAP=1, e0f33e7 | 3.17 M frames. Chain A dead zone 0. Chain B biased by the pairing bug (2.65 % timeouts): do NOT use lut_cd7_ds_b |

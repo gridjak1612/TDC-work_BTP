@@ -26,3 +26,5 @@ a.out
 # ---- raw captures: too big for git, tracked via data/MANIFEST.md ----
 data/raw/
 __pycache__/
+uart_bytes.txt
+uart_bytes.txt

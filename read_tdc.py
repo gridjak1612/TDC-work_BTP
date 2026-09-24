@@ -119,7 +119,8 @@ def interval_ps(r, lut_a, lut_b, t_clk_ns=T_CLK_NS):
     tb = lut_b.get(r['fine_b'])
     if ta is None or tb is None:
         return None
-    return r['d_coarse'] * t_clk_ns * 1000.0 + (ta - tb)
+    dc = r['d_coarse'] - (1 << 14) if r['d_coarse'] >= (1 << 13) else r['d_coarse']
+    return dc * t_clk_ns * 1000.0 + (tb - ta)      # interval = B - A; t = E[phase], so fine part is tb - ta
 
 
 def crc8(data):
