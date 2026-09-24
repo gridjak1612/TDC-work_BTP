@@ -97,7 +97,9 @@ def analyse(rows, ch, args):
     n_all = len(rows)
     railed = sum(1 for r in rows if r[fk] in (0, TDL_TAPS))
     invalid = sum(1 for r in rows if not r[vk] and r[fk] not in (0, TDL_TAPS))
-    codes = [r[fk] for r in rows if r[vk] and r[fk] not in (0, TDL_TAPS)]
+    keep_inv = bool(args and getattr(args, 'include_invalid', False))
+    codes = [r[fk] for r in rows
+             if (r[vk] or keep_inv) and r[fk] not in (0, TDL_TAPS)]
 
     w, cnt, lo, hi = widths_from_codes(codes, n_all)
     nreach = hi - lo + 1
@@ -111,7 +113,7 @@ def analyse(rows, ch, args):
     print(f"  railed (dead zone) : {railed} hits = {railed / n_all * PERIOD_PS:6.1f} ps "
           f"of the period")
     print(f"  invalid (bubbles)  : {invalid} hits = {invalid / n_all * 100:.3f} %  "
-          f"(time location unknown; widths below exclude it)")
+          + ("(INCLUDED at their ones-count code)" if keep_inv else "(excluded from widths)"))
     print(f"  reachable codes    : {lo}..{hi} ({nreach}),  zero-width {zero} "
           f"({100 * zero / nreach:.1f} %)")
     print(f"  LSB                : {lsb:.2f} ps")
@@ -178,30 +180,38 @@ def write_lut(path, res, shift=0.0):
                          f"{res['w'][c]:.3f}", f"{res['dnl'][c]:.3f}"])
     print(f"  LUT written: {path}")
 
-
-def compare(res, path):
+def compare(res, path, rng=None):
     ref = {}
     with open(path, newline='') as fh:
         for r in csv.DictReader(fh):
             ref[int(r['code'])] = float(r['bin_width_ps'])
     common = [c for c in range(res['lo'], res['hi'] + 1) if c in ref]
+    if rng:
+        common = [c for c in common if rng[0] <= c <= rng[1]]
     if len(common) < 10:
         print(f"  compare {path}: only {len(common)} common codes -- different build?")
         return
-    d = [res['w'][c] - ref[c] for c in common]
-    rms = math.sqrt(sum(x * x for x in d) / len(d))
-    a = [res['w'][c] for c in common]; b = [ref[c] for c in common]
+    a = [res['w'][c] for c in common]
+    b = [ref[c] for c in common]
     ma, mb = sum(a) / len(a), sum(b) / len(b)
     cor = (sum((x - ma) * (y - mb) for x, y in zip(a, b)) /
            math.sqrt(sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b)))
-    cum, acc = [], 0.0
-    for x in d:
-        acc += x; cum.append(acc)
-    print(f"  vs {path}: {len(common)} codes, width diff rms {rms:.2f} ps, "
-          f"correlation {cor:.3f}")
-    print(f"      cumulative (INL) difference {min(cum):+.0f} / {max(cum):+.0f} ps"
-          f"  <- smooth drift here = reference nonlinearity, not chain INL")
-
+    k = sum(a) / sum(b)                       # global scale: this run vs reference
+    def cum(d):
+        out, acc = [], 0.0
+        for x in d:
+            acc += x; out.append(acc)
+        return out
+    raw = cum([x - y for x, y in zip(a, b)])
+    shp = cum([x - k * y for x, y in zip(a, b)])
+    rms = math.sqrt(sum((x - k * y) ** 2 for x, y in zip(a, b)) / len(a))
+    print(f"  vs {path}: {len(common)} codes, per-bin corr {cor:.3f}, "
+          f"per-bin diff rms {rms:.2f} ps (after scale)")
+    print(f"      span over common codes: this {sum(a):.0f} ps, ref {sum(b):.0f} ps "
+          f"-> scale {100 * (k - 1):+.2f} %")
+    print(f"      cumulative diff, raw          : {min(raw):+.0f} / {max(raw):+.0f} ps")
+    print(f"      cumulative diff, scale removed: {min(shp):+.0f} / {max(shp):+.0f} ps"
+          f"   <- only THIS can be reference nonlinearity")
 
 def selftest():
     """Uniform hits through a chain with KNOWN widths must give them back."""
@@ -228,10 +238,14 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser(description="Code-density calibration from RO hits")
     ap.add_argument("csv", nargs="?")
+    ap.add_argument("--cmp-range", nargs=2, type=int, default=None,
+                    help="compare only codes LO..HI (skip dead-zone boundary bins)")
     ap.add_argument("--from-bytes", default=None, help="hex-per-line UART dump (sim)")
     ap.add_argument("--out-lut", default=None, help="prefix -> <p>_a.csv, <p>_b.csv")
     ap.add_argument("--compare", default=None,
                     help="LUT prefix with bin_width_ps (DPS or other RO build)")
+    ap.add_argument("--include-invalid", action="store_true",
+                    help="count bubble-flagged hits at their ones-count code")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -260,8 +274,8 @@ def main():
 
     if a.compare:
         print()
-        compare(ra, f"{a.compare}_a.csv")
-        compare(rb, f"{a.compare}_b.csv")
+        compare(ra, f"{a.compare}_a.csv", a.cmp_range)
+        compare(rb, f"{a.compare}_b.csv", a.cmp_range)
     if a.out_lut:
         print()
         write_lut(f"{a.out_lut}_a.csv", ra)
