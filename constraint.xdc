@@ -82,7 +82,7 @@ set_false_path -to [get_ports uart_txd]
 set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *cap_ctrl_inst/stop_sync_reg*}]
 set_property ASYNC_REG true [get_cells -hierarchical -filter {NAME =~ *cap_ctrl_inst/clr_sync_reg*}]
 # ---- Source-select switches (used by EVENT_SRC = 4 builds) --------------------
-set_property -dict {PACKAGE_PIN U2 IOSTANDARD LVCMOS33} [get_ports {sw_src[0]}]
+set_property -dict {PACKAGE_PIN T2 IOSTANDARD LVCMOS33} [get_ports {sw_src[0]}]
 set_property -dict {PACKAGE_PIN U1 IOSTANDARD LVCMOS33} [get_ports {sw_src[1]}]
 set_false_path -from [get_ports {sw_src[*]}]
 # =============================================================================
