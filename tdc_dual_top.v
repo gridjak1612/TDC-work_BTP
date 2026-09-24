@@ -54,7 +54,8 @@ module tdc_dual_top #(
     // timeout test alone is 82 us of simulated time and dominates the runtime.
     parameter integer TIMEOUT_CYCLES = (1 << COARSE_BITS),
     parameter integer TAP_SRC        = 0,    // 1 = XORCY probe build
-    parameter integer SYNC_TAP       = 30    // 0 = old raw-event sync
+    parameter integer SYNC_TAP       = 30,    // 0 = old raw-event sync
+    parameter integer DUAL_SNAP      = 1     // step 4 dead-zone fix
 )(
     input  wire                   clk100,
     input  wire                   rst,
@@ -174,7 +175,7 @@ module tdc_dual_top #(
 
     tdc_channel #(
         .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
-        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP),
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP),
         .FINE_LATENCY(FINE_LATENCY)
     ) chan_a (
         .clk          (clk200_i),
@@ -199,7 +200,7 @@ module tdc_dual_top #(
 
     tdc_channel #(
         .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
-        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP),
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP),
         .FINE_LATENCY(FINE_LATENCY)
     ) chan_b (
         .clk          (clk200_i),

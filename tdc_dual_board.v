@@ -77,7 +77,8 @@ module tdc_dual_board #(
     parameter integer SYNC_TAP         = 30,  // 0 = old raw-event sync
     // ---- ring-oscillator hit source (EVENT_SRC = 3 only) --------------------
     parameter integer RO_STAGES        = 7,   // odd. Build 7 AND 11 to cross-check
-    parameter integer RO_DIV_BITS      = 10   // event period ~ 2^10 RO periods
+    parameter integer RO_DIV_BITS      = 10,   // event period ~ 2^10 RO periods
+    parameter integer DUAL_SNAP        = 1    // step 4: dead-zone fix, 0 = old capture
 )(
     input  wire        clk100,        // F14
     input  wire        rst,           // J2  btn0
@@ -149,7 +150,7 @@ module tdc_dual_board #(
     tdc_dual_top #(
         .NUM_CARRY4(88), .TDL_WIDTH(352), .FINE_BITS(FINE_BITS),
         .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(4), .FINE_LATENCY(12),
-        .CAL_EVENT(CAL_EVENT_MODE), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .PHASE_BITS(PHASE_BITS)
+        .CAL_EVENT(CAL_EVENT_MODE), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP), .PHASE_BITS(PHASE_BITS)
     ) core (
         .clk100       (clk100),
         .rst          (rst),

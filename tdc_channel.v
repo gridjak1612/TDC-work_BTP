@@ -78,7 +78,10 @@ module tdc_channel #(
     // The constant SYNC_TAP offset cancels in the A-B difference. It must be
     // subtracted for an absolute timestamp.
     // -------------------------------------------------------------------------
-    parameter integer SYNC_TAP     = 30
+    parameter integer SYNC_TAP     = 30,
+    // DUAL_SNAP -- dead-zone fix (step 4): if the chosen edge is already full,
+    // take the previous edge's taps AND coarse. 0 = old behaviour.
+    parameter integer DUAL_SNAP    = 1
 )(
     input  wire                    clk,           // clk200
     input  wire                    rst,           // active high
@@ -149,15 +152,19 @@ module tdc_channel #(
     // Taps and coarse use the SAME depth -> they describe the SAME clock edge.
     // -------------------------------------------------------------------------
     wire [TDL_WIDTH-1:0]   sampled_taps;
+    wire                   tap_full;
+    wire                   use_prev = (DUAL_SNAP != 0) && tap_full;
 
     snapshot_pipeline #(.WIDTH(TDL_WIDTH), .DEPTH(CAPTURE_LAG)) tap_snap_inst (
         .clk (clk), .rst (rst), .capture_enable (capture_enable),
-        .din (tdl_taps), .captured (sampled_taps)
+        .din (tdl_taps), .captured (sampled_taps),
+        .use_prev (use_prev), .top_now (tap_full)
     );
 
     snapshot_pipeline #(.WIDTH(COARSE_BITS), .DEPTH(CAPTURE_LAG)) coarse_snap_inst (
         .clk (clk), .rst (rst), .capture_enable (capture_enable),
-        .din (coarse_count), .captured (coarse_out)
+        .din (coarse_count), .captured (coarse_out),
+        .use_prev (use_prev), .top_now ()
     );
 
     // -------------------------------------------------------------------------
