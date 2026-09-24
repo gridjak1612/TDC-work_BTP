@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-read_tdc.py -- host reader for the two-channel interval TDC, 8-byte frame.
+read_tdc.py -- host reader for the two-channel interval TDC, 9-byte frame.
 
-FRAME (8 bytes, 8N1 @ 2 Mbaud)
+FRAME (9 bytes, 8N1 @ 2 Mbaud)
 
-    byte0 : 0xA5                                       sync header
+    byte0 : 0xA6                                       sync header
     byte1 : fine_a[7:0]
     byte2 : fine_b[7:0]
     byte3 : d_coarse[7:0]
@@ -12,8 +12,15 @@ FRAME (8 bytes, 8N1 @ 2 Mbaud)
     byte5 : phase_idx[7:0]
     byte6 : {2'b00, valid_b, valid_a, phase_idx[11:8]}
     byte7 : seq[7:0]
+    byte8 : CRC-8, poly 0x07, init 0x00, over bytes 0..7
 
-WHAT CHANGED, AND WHY IT MATTERS
+CRC (0xA5 -> 0xA6)
+------------------
+The stride check alone let one corrupt frame (phase = -859) into sweep_v2.csv.
+Every frame is now CRC-checked; a failure drops the frame, is counted, and
+forces a resync. Header changed so an 8-byte host cannot mis-parse silently.
+
+WHAT CHANGED (history), AND WHY IT MATTERS
 --------------------------------
 The previous host parsed a FIVE byte frame while the RTL sent SIX. It stayed in
 sync by luck -- byte 5 was never 0xAA, so the resync path silently discarded it
@@ -52,8 +59,8 @@ import time
 import argparse
 from collections import Counter, defaultdict
 
-FRAME_LEN = 8
-HEADER = 0xA5
+FRAME_LEN = 9
+HEADER = 0xA6
 TDL_TAPS = 352          # 88 CARRY4 x 4. fine ranges 0..352, NOT 0..255.
 T_CLK_NS = 5.000        # 200 MHz sampler
 PHASE_STEP_PS = 1000.0 / 56.0    # MMCM fine step = T_VCO/56, VCO = 1000 MHz
@@ -115,10 +122,31 @@ def interval_ps(r, lut_a, lut_b, t_clk_ns=T_CLK_NS):
     return r['d_coarse'] * t_clk_ns * 1000.0 + (ta - tb)
 
 
+def crc8(data):
+    """CRC-8, poly 0x07, init 0, MSB-first. Mirrors crc8_64() in tdc_dual_board.v."""
+    c = 0
+    for b in data:
+        c ^= b
+        for _ in range(8):
+            c = ((c << 1) ^ 0x07) & 0xFF if c & 0x80 else (c << 1) & 0xFF
+    return c
+
+
+def pack(fine_a, fine_b, d_coarse, valid_a, valid_b, phase, seq):
+    """Inverse of unpack(); mirrors frame_w + CRC. Used by the self-test."""
+    ph = phase & 0xFFF
+    b = bytes([HEADER, fine_a & 0xFF, fine_b & 0xFF, d_coarse & 0xFF,
+               ((d_coarse >> 8) << 2) | ((fine_a >> 8) << 1) | (fine_b >> 8),
+               ph & 0xFF, (valid_b << 5) | (valid_a << 4) | (ph >> 8), seq & 0xFF])
+    return b + bytes([crc8(b)])
+
+
 def unpack(f):
-    """Decode one 8-byte frame. Mirrors frame_w in tdc_dual_board.v."""
+    """Decode one 9-byte frame. Mirrors frame_w in tdc_dual_board.v."""
     if len(f) != FRAME_LEN or f[0] != HEADER:
         raise ValueError("not a frame")
+    if crc8(f[:8]) != f[8]:
+        raise ValueError("crc")
     fine_a = (((f[4] >> 1) & 1) << 8) | f[1]
     fine_b = ((f[4] & 1) << 8) | f[2]
     d_coarse = ((f[4] >> 2) << 8) | f[3]
@@ -133,13 +161,12 @@ def unpack(f):
 
 class Framer:
     """
-    Byte-stream -> frames, with stride-verified sync.
+    Byte-stream -> frames. A frame is accepted only if header AND CRC match.
 
-    A payload byte can legitimately equal 0xA5, so "first byte is 0xA5" is not
-    proof of alignment. Sync is only declared once headers land at the correct
-    8-byte stride LOCK_FRAMES times running, and is dropped the moment the
-    stride breaks. Accepting on a single header match is how a misaligned
-    stream gets parsed as valid data.
+    Lock needs LOCK_FRAMES consecutive CRC-good frames at the 9-byte stride.
+    Any header or CRC failure drops ONE byte and restarts the search, so a
+    misaligned stream cannot be parsed as data. crc_errors counts CRC failures
+    seen while locked -- i.e. real corruption, not sync hunting.
     """
     LOCK_FRAMES = 3
 
@@ -148,6 +175,13 @@ class Framer:
         self.locked = False
         self.streak = 0
         self.resyncs = 0
+        self.crc_errors = 0
+
+    def _lose_lock(self):
+        if self.locked:
+            self.resyncs += 1
+        self.locked = False
+        self.streak = 0
 
     def feed(self, chunk):
         self.buf.extend(chunk)
@@ -155,12 +189,15 @@ class Framer:
         while len(self.buf) >= FRAME_LEN:
             if self.buf[0] != HEADER:
                 del self.buf[0]
-                if self.locked:
-                    self.locked = False
-                    self.streak = 0
-                    self.resyncs += 1
+                self._lose_lock()
                 continue
             frame = bytes(self.buf[:FRAME_LEN])
+            if crc8(frame[:8]) != frame[8]:
+                if self.locked:
+                    self.crc_errors += 1
+                del self.buf[0]
+                self._lose_lock()
+                continue
             del self.buf[:FRAME_LEN]
             if self.locked:
                 out.append(unpack(frame))
@@ -254,43 +291,73 @@ def _mean(counter):
 # Self-test -- runs without hardware, checks against RTL-generated vectors
 # ---------------------------------------------------------------------------
 
+# Payload vectors (bytes 1..7) were produced by the RTL frame_w expression; the
+# payload layout is unchanged, so they still pin the field packing.
 VECTORS = [
-    # fine_a fine_b d_coarse va vb phase seq   bytes
-    ((0,     0,     0,       0, 0, 0,     0),   "a5 00 00 00 00 00 00 00"),
-    ((1,     2,     3,       1, 1, 1,     1),   "a5 01 02 03 00 01 30 01"),
-    ((351,   352,   16383,   1, 0, 279,   200), "a5 5f 60 ff ff 17 11 c8"),
-    ((300,   260,   1234,    0, 1, -1,    255), "a5 2c 04 d2 13 ff 2f ff"),
-    ((256,   255,   8192,    1, 1, -280,  77),  "a5 00 ff 00 82 e8 3e 4d"),
-    ((128,   64,    0,       1, 1, -2048, 1),   "a5 80 40 00 00 00 38 01"),
-    ((511,   511,   16383,   1, 1, 2047,  254), "a5 ff ff ff ff ff 37 fe"),
+    # fine_a fine_b d_coarse va vb phase seq   payload bytes 1..7
+    ((0,     0,     0,       0, 0, 0,     0),   "00 00 00 00 00 00 00"),
+    ((1,     2,     3,       1, 1, 1,     1),   "01 02 03 00 01 30 01"),
+    ((351,   352,   16383,   1, 0, 279,   200), "5f 60 ff ff 17 11 c8"),
+    ((300,   260,   1234,    0, 1, -1,    255), "2c 04 d2 13 ff 2f ff"),
+    ((256,   255,   8192,    1, 1, -280,  77),  "00 ff 00 82 e8 3e 4d"),
+    ((128,   64,    0,       1, 1, -2048, 1),   "80 40 00 00 00 38 01"),
+    ((511,   511,   16383,   1, 1, 2047,  254), "ff ff ff ff ff 37 fe"),
+]
+
+# Whole frames captured from the RTL in simulation (tb_ro_cd.v): Python crc8()
+# must agree with the Verilog crc8_64() byte for byte.
+RTL_FRAMES = [
+    "a6 c2 c2 00 00 00 30 00 fc",
+    "a6 0c 0c 00 03 00 30 01 0b",
+    "a6 e8 e8 00 00 00 30 02 26",
 ]
 
 
 def selftest():
-    """Decode byte vectors produced by the actual RTL frame_w expression."""
     bad = 0
     for (fa, fb, dc, va, vb, ph, sq), hexs in VECTORS:
-        f = bytes(int(x, 16) for x in hexs.split())
+        payload = bytes(int(x, 16) for x in hexs.split())
+        f = bytes([HEADER]) + payload
+        f = f + bytes([crc8(f)])
         r = unpack(f)
         want = dict(fine_a=fa, fine_b=fb, d_coarse=dc,
                     valid_a=va, valid_b=vb, phase=ph, seq=sq)
-        if r != want:
+        if r != want or pack(fa, fb, dc, va, vb, ph, sq) != f:
             bad += 1
-            print(f"  MISMATCH {hexs}")
-            for k in want:
-                if r[k] != want[k]:
-                    print(f"      {k}: got {r[k]}  want {want[k]}")
-    print(f"unpack(): {len(VECTORS) - bad}/{len(VECTORS)} RTL vectors decoded correctly")
+            print(f"  MISMATCH {hexs}: got {r}")
+    print(f"pack/unpack : {len(VECTORS) - bad}/{len(VECTORS)} RTL payload vectors")
 
-    # framer must reject a stream offset by one byte rather than locking to it
-    good = b"".join(bytes(int(x, 16) for x in h.split()) for _, h in VECTORS) * 3
+    nbad = 0
+    for h in RTL_FRAMES:
+        f = bytes(int(x, 16) for x in h.split())
+        if crc8(f[:8]) != f[8]:
+            nbad += 1
+            print(f"  CRC MISMATCH vs RTL: {h}")
+    bad += nbad
+    print(f"crc8 vs RTL : {len(RTL_FRAMES) - nbad}/{len(RTL_FRAMES)} frames agree")
+
+    good = b"".join(pack(*v) for v, _ in VECTORS) * 3
+    n_frames = len(VECTORS) * 3
     fr = Framer()
     n_ok = len(fr.feed(good))
-    fr2 = Framer()
-    n_shift = len(fr2.feed(b"\x00" + good[:-1]))
-    print(f"framer  : aligned stream -> {n_ok} frames "
-          f"(expect {len(VECTORS) * 3 - Framer.LOCK_FRAMES + 1})")
-    print(f"framer  : resyncs on offset stream = {fr2.resyncs > 0 or n_shift < n_ok}")
+    exp = n_frames - Framer.LOCK_FRAMES + 1
+    print(f"framer      : aligned stream -> {n_ok} frames (expect {exp})")
+    bad += n_ok != exp
+
+    corrupt = bytearray(good)
+    corrupt[9 * 10 + 4] ^= 0x10
+    fr3 = Framer()
+    got = fr3.feed(bytes(corrupt))
+    print(f"framer      : 1 corrupt frame -> crc_errors={fr3.crc_errors} (expect 1), "
+          f"frames {len(got)}")
+    bad += fr3.crc_errors != 1
+
+    dropped = good[:9 * 10 + 3] + good[9 * 10 + 4:]
+    fr4 = Framer()
+    got4 = fr4.feed(dropped)
+    ok4 = all(r in [unpack(pack(*v)) for v, _ in VECTORS] for r in got4)
+    print(f"framer      : 1 dropped byte -> only legal frames emitted = {ok4}")
+    bad += not ok4
 
     # sequence-gap accounting must survive the 8-bit wrap
     st = Stats()
@@ -303,13 +370,14 @@ def selftest():
         st2.add(dict(fine_a=10, fine_b=10, d_coarse=0, phase=0,
                      valid_a=1, valid_b=1, seq=s))
     print(f"seq gap : dropped = {st2.dropped} (expect 2)")
+    print("SELFTEST", "PASS" if bad == 0 else f"FAIL ({bad})")
     return 0 if bad == 0 else 1
 
 
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Two-channel TDC reader, 8-byte frame")
+    p = argparse.ArgumentParser(description="Two-channel TDC reader, 9-byte CRC frame")
     p.add_argument("port", nargs="?")
     p.add_argument("--baud", type=int, default=2000000)
     p.add_argument("--out", default="tdc_log.csv")
@@ -342,7 +410,7 @@ def main():
         print("bitstream it was measured on and you will want to recheck.")
 
     ser = serial.Serial(a.port, a.baud, timeout=0.1)
-    print(f"Listening on {a.port} @ {a.baud} 8N1, 8-byte frames. Ctrl-C to stop.")
+    print(f"Listening on {a.port} @ {a.baud} 8N1, 9-byte CRC frames. Ctrl-C to stop.")
     print(f"phase step = {PHASE_STEP_PS:.3f} ps, "
           f"{round(T_CLK_NS * 1000 / PHASE_STEP_PS)} steps per {T_CLK_NS} ns period")
     print("-" * 78)
@@ -399,8 +467,9 @@ def main():
               f"   (two similar independent chains)")
 
     print(f"\n  {st.n} frames -> {a.out}   ({time.time() - t0:.1f} s)")
-    if fr.resyncs:
-        print(f"  WARNING: {fr.resyncs} resync events -- check baud and cabling")
+    if fr.resyncs or fr.crc_errors:
+        print(f"  WARNING: {fr.resyncs} resyncs, {fr.crc_errors} CRC errors "
+              f"-- check baud and cabling. Corrupt frames were dropped, not parsed.")
     st.report()
 
 

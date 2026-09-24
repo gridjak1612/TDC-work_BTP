@@ -2,8 +2,8 @@
 // Module Name:  tdc_dual_board
 // Description:  Board top for the TWO-CHANNEL interval TDC.
 //
-//   UART FRAME - 8 bytes per measurement, 8N1 @ 2 Mbaud
-//     byte0 : 0xA5                                       sync header
+//   UART FRAME - 9 bytes per measurement, 8N1 @ 2 Mbaud
+//     byte0 : 0xA6                                       sync header
 //     byte1 : fine_a[7:0]                                START fine, low 8
 //     byte2 : fine_b[7:0]                                STOP  fine, low 8
 //     byte3 : d_coarse[7:0]
@@ -11,6 +11,12 @@
 //     byte5 : phase_idx[7:0]                             MMCM phase, low 8
 //     byte6 : {2'b00, valid_b, valid_a, phase_idx[11:8]} flags + phase high
 //     byte7 : seq[7:0]                                   per-measurement counter
+//     byte8 : CRC-8 (poly 0x07, init 0x00) over bytes 0..7
+//
+//   CRC: a lost UART byte used to be caught only by the host's stride check,
+//   and one corrupt frame (phase = -859) still reached sweep_v2.csv. For code
+//   density a corrupt frame lands in a random bin, so every frame is now
+//   checked. Header moved 0xA5 -> 0xA6 so an 8-byte host fails loudly.
 //
 //   phase_idx is SIGNED 12-bit two's complement. The host must sign-extend it;
 //   reading it as unsigned puts every negative phase step at ~4000 instead of
@@ -22,20 +28,13 @@
 //   measurement at all. Code-density work needs that distinction: otherwise a
 //   lost sample is indistinguishable from a genuinely empty bin.
 //
-//   Header is 0xA5, not the old 0xAA, so a stale host fails loudly rather than
-//   silently mis-decoding (which is what the 5-vs-6 byte mismatch did).
-//
-//   Frame time = 8 bytes x 10 bits / 2e6 = 40 us -> 25 kframe/s.
+//   Frame time = 9 bytes x 10 bits / 2e6 = 45 us -> 22.2 kframe/s.
 //   CLKS_PER_BIT = 200e6/2e6 = 100 exactly; no divisor error.
 //
 //   RAW fields are shipped, NOT a computed time. tau_a != tau_b and neither is
 //   a single number (bins are non-uniform), so the conversion is a per-channel
 //   lookup table that lives on the host and can be re-derived without touching
 //   the bitstream.
-//
-//   Frame time = 6 bytes x 10 bits / 115200 = 521 us -> max ~1.9 kHz.
-//   For faster calibration runs raise the baud (CLKS_PER_BIT = 200e6 / baud;
-//   921600 -> 217).
 //
 //   EVENT_SRC is a PARAMETER, not a switch, on purpose.
 //   A runtime mux would put a LUT in the launch path of both carry chains,
@@ -45,6 +44,9 @@
 //
 //     EVENT_SRC = 0 : buttons          (bring-up)
 //     EVENT_SRC = 1 : external pins    (function generator / laser / cables)
+//     EVENT_SRC = 2 : clk_cal + DPS sweep (phase-referenced calibration)
+//     EVENT_SRC = 3 : on-chip ring oscillator, both chains (code density).
+//                     Needs ro.xdc. phase field is 0 in these frames.
 //
 //   TIE_CHANNELS = 1 drives BOTH chains from event A. Feed one generator in and
 //   you get two independent fine histograms in a single run, AND the spread of
@@ -58,7 +60,7 @@ module tdc_dual_board #(
     // 3 Mbaud (66.67 -> 66 -> +1.0 % per bit, 10 % of a bit by the stop).
     // 8 bytes x 10 bits / 2 Mbaud = 40 us/frame -> 25 kframe/s.
     parameter integer CLKS_PER_BIT = 100,    // 200 MHz / 2 Mbaud
-    parameter integer EVENT_SRC    = 2,      // 0 = buttons, 1 = external pins
+    parameter integer EVENT_SRC    = 2,      // 0 btn, 1 ext, 2 DPS cal, 3 ring osc
     parameter integer TIE_CHANNELS = 0,      // 1 = drive both chains from A
     parameter integer HB_BIT       = 26,
     parameter integer VIS_BITS     = 24,
@@ -72,7 +74,10 @@ module tdc_dual_board #(
     // measurement. Do not trim this to save time you will not notice.
     parameter integer SETTLE_CYCLES    = 2000,
     parameter integer TAP_SRC          = 0,   // 1 = XORCY probe build
-    parameter integer SYNC_TAP         = 30   // 0 = old raw-event sync
+    parameter integer SYNC_TAP         = 30,  // 0 = old raw-event sync
+    // ---- ring-oscillator hit source (EVENT_SRC = 3 only) --------------------
+    parameter integer RO_STAGES        = 7,   // odd. Build 7 AND 11 to cross-check
+    parameter integer RO_DIV_BITS      = 10   // event period ~ 2^10 RO periods
 )(
     input  wire        clk100,        // F14
     input  wire        rst,           // J2  btn0
@@ -103,9 +108,18 @@ module tdc_dual_board #(
     end else if (EVENT_SRC == 1) begin : g_ext
         assign event_a_src = ev_a_ext;
         assign event_b_src = (TIE_CHANNELS != 0) ? ev_a_ext : ev_b_ext;
-    end else begin : g_cal            // EVENT_SRC == 2: calibration
+    end else if (EVENT_SRC == 2) begin : g_cal   // DPS calibration
         assign event_a_src = 1'b0;    // unused: core drives both chains from clk_cal
         assign event_b_src = 1'b0;
+    end else begin : g_ro                        // EVENT_SRC == 3: code density
+        // One RO edge drives BOTH chains: two independent histograms per run,
+        // plus the A-B spread at d ~ 0 for free. Constant-folded like the
+        // other sources -- the RO only exists in this build.
+        wire ro_event;
+        ring_osc_event #(.STAGES(RO_STAGES), .DIV_BITS(RO_DIV_BITS)) ro_inst (
+            .enable (~rst), .event_out (ro_event));
+        assign event_a_src = ro_event;
+        assign event_b_src = ro_event;
     end
     endgenerate
 
@@ -207,9 +221,9 @@ module tdc_dual_board #(
     end
 
     // -------------------------------------------------------------------------
-    // UART framing -- 8 bytes, shifted out of a snapshot register.
+    // UART framing -- 9 bytes, shifted out of a snapshot register.
     //
-    //   byte0 : 0xA5                                       sync header
+    //   byte0 : 0xA6                                       sync header
     //   byte1 : fine_a[7:0]
     //   byte2 : fine_b[7:0]
     //   byte3 : d_coarse[7:0]
@@ -217,11 +231,7 @@ module tdc_dual_board #(
     //   byte5 : phase_idx[7:0]
     //   byte6 : {2'b00, valid_b, valid_a, phase_idx[11:8]}
     //   byte7 : seq[7:0]
-    //
-    // Header is 0xA5, NOT the old 0xAA. The previous 6-byte frame was parsed by
-    // a host that expected 5 bytes; it stayed in sync by luck and silently
-    // mis-decoded every field. Changing the header makes an out-of-date host
-    // fail loudly instead of quietly reporting wrong numbers.
+    //   byte8 : CRC-8/0x07 over bytes 0..7 (computed at load, travels with sr)
     //
     // WHY A SHIFT REGISTER AND NOT A BYTE-PER-STATE FSM
     // The whole frame is snapshotted into `sr` at load time. A measurement that
@@ -236,10 +246,23 @@ module tdc_dual_board #(
     reg [7:0]  uart_byte;
     reg        pending;
     reg        frame_done;
-    reg [63:0] sr;
+    reg [71:0] sr;
     reg [3:0]  nleft;
 
-    wire [63:0] frame_w = { 8'hA5,
+    // CRC-8, poly x^8+x^2+x+1 (0x07), init 0, MSB-first over bytes 0..7.
+    function [7:0] crc8_64;
+        input [63:0] d;
+        integer i;
+        reg [7:0] c;
+        begin
+            c = 8'h00;
+            for (i = 63; i >= 0; i = i - 1)
+                c = {c[6:0], 1'b0} ^ ((c[7] ^ d[i]) ? 8'h07 : 8'h00);
+            crc8_64 = c;
+        end
+    endfunction
+
+    wire [63:0] frame_w = { 8'hA6,
                             fa_l[7:0],
                             fb_l[7:0],
                             dc_l[7:0],
@@ -247,11 +270,12 @@ module tdc_dual_board #(
                             ph_l[7:0],
                             {2'b00, vb_l, va_l, ph_l[11:8]},
                             seq_l };
+    wire [71:0] frame_c = { frame_w, crc8_64(frame_w) };
 
     always @(posedge clk200) begin
         if (rst200) begin
             uart_send <= 1'b0; uart_byte <= 8'h00; pending <= 1'b0;
-            frame_done <= 1'b0; sr <= 64'd0; nleft <= 4'd0;
+            frame_done <= 1'b0; sr <= 72'd0; nleft <= 4'd0;
         end else begin
             uart_send  <= 1'b0;
             frame_done <= 1'b0;
@@ -261,14 +285,14 @@ module tdc_dual_board #(
             if (nleft == 4'd0) begin
                 if (pending && !uart_busy && !uart_send) begin
                     pending   <= 1'b0;
-                    uart_byte <= frame_w[63:56];   // header out now
-                    sr        <= {frame_w[55:0], 8'h00};
+                    uart_byte <= frame_c[71:64];   // header out now
+                    sr        <= {frame_c[63:0], 8'h00};
                     uart_send <= 1'b1;
-                    nleft     <= 4'd7;             // 7 payload bytes still to go
+                    nleft     <= 4'd8;             // 7 payload + CRC still to go
                 end
             end else if (!uart_busy && !uart_send) begin
-                uart_byte <= sr[63:56];
-                sr        <= {sr[55:0], 8'h00};
+                uart_byte <= sr[71:64];
+                sr        <= {sr[63:0], 8'h00};
                 uart_send <= 1'b1;
                 nleft     <= nleft - 1'b1;
                 if (nleft == 4'd1) frame_done <= 1'b1;
@@ -318,7 +342,10 @@ module tdc_dual_board #(
     reg [SW_SET_W-1:0]  sw_settle;
     reg                 sw_mismatch; // sticky: local mirror != ps_phase_idx
 
-    wire sweep_on   = (AUTO_SWEEP != 0) && sw_autorearm;
+    // Only a DPS build has a phase to sweep. Previously the FSM also ran in
+    // button/external builds: it stalled re-arm for every SETTLE window and set
+    // sw_mismatch (led[7]) because ps_phase_idx is tied to 0 there.
+    wire sweep_on   = (AUTO_SWEEP != 0) && (CAL_EVENT_MODE != 0) && sw_autorearm;
     wire sweep_hold = sweep_on && (sw_state != SW_COLLECT);
 
     always @(posedge clk200) begin
@@ -404,11 +431,27 @@ module tdc_dual_board #(
     // frequency -- so the sampled phases stay uncorrelated with the clock.
     // Stretched to 4 cycles so the channel's 2-FF clear synchroniser sees it.
     // -------------------------------------------------------------------------
+    //
+    // DEADLOCK FIX: a frame_done arriving while sweep_hold is high used to be
+    // dropped. The channels then sat 'done' forever: no measurement, no frame,
+    // no re-arm. It only worked because SETTLE (10 us) < frame time; a faster
+    // baud or a longer settle stalled the sweep after the first step.
+    // Now the request is remembered and fired when the hold lifts.
     reg [2:0] rearm_cnt;
+    reg       rearm_pend;
+    wire      rearm_req = sw_autorearm && (frame_done || rearm_pend);
     always @(posedge clk200) begin
-        if (rst200)                          rearm_cnt <= 3'd0;
-        else if (sw_autorearm && frame_done && !sweep_hold) rearm_cnt <= 3'd4;
-        else if (rearm_cnt != 3'd0)          rearm_cnt <= rearm_cnt - 1'b1;
+        if (rst200) begin
+            rearm_cnt  <= 3'd0;
+            rearm_pend <= 1'b0;
+        end else if (rearm_req && !sweep_hold) begin
+            rearm_cnt  <= 3'd4;
+            rearm_pend <= 1'b0;
+        end else begin
+            if (rearm_req)               rearm_pend <= 1'b1;   // held off: remember
+            if (!sw_autorearm)           rearm_pend <= 1'b0;
+            if (rearm_cnt != 3'd0)       rearm_cnt  <= rearm_cnt - 1'b1;
+        end
     end
 
     assign rearm = btn_clear | (rearm_cnt != 3'd0);
