@@ -54,7 +54,8 @@ module tdc_dual_top #(
     parameter integer TIMEOUT_CYCLES = (1 << COARSE_BITS),
     parameter integer TAP_SRC        = 0,    // 1 = XORCY probe build
     parameter integer SYNC_TAP       = 30,   // 0 = old raw-event sync
-    parameter integer DUAL_SNAP      = 1     // step 4 dead-zone fix
+    parameter integer DUAL_SNAP      = 1,    // step 4 dead-zone fix
+    parameter integer RAW_W          = 159   // raw snapshot width (FOLD: 32+120+7)
 )(
     input  wire                   clk100,
     input  wire                   rst,
@@ -84,7 +85,8 @@ module tdc_dual_top #(
     output wire                   done_b,
     output wire                   clk200,
     output wire                   mmcm_locked,
-    output wire                   rst_sync       // synchronised reset, clk200 domain
+    output wire                   rst_sync,      // synchronised reset, clk200 domain
+    output wire [RAW_W-1:0]       raw_a          // channel A captured snapshot (DUMP builds)
 );
 
     wire clk200_i, clk_cal_i, mmcm_locked_i;
@@ -199,11 +201,21 @@ module tdc_dual_top #(
     wire [FINE_BITS-1:0]   fine_a_w;
     wire                   valid_a_w, ready_a_w;
 
+`ifdef FOLD
+    // FOLDING channel (folding step 2). Same instance name so the placement
+    // constraints keep their paths; module chosen by the FOLD define.
+    tdc_channel_fold #(
+        .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP),
+        .FINE_LATENCY(FINE_LATENCY)
+    ) chan_a (
+`else
     tdc_channel #(
         .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
         .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP),
-        .FINE_LATENCY(FINE_LATENCY)
+        .FINE_LATENCY(FINE_LATENCY), .RAW_W(RAW_W)
     ) chan_a (
+`endif
         .clk          (clk200_i),
         .rst          (rst_i),
         .clear_status (clear_status),
@@ -213,7 +225,8 @@ module tdc_dual_top #(
         .valid_out    (valid_a_w),
         .ready        (ready_a_w),
         .done         (done_a),
-        .event_in     (event_a_i)
+        .event_in     (event_a_i),
+        .raw_out      (raw_a)
     );
 
     // -------------------------------------------------------------------------
@@ -223,11 +236,19 @@ module tdc_dual_top #(
     wire [FINE_BITS-1:0]   fine_b_w;
     wire                   valid_b_w, ready_b_w;
 
+`ifdef FOLD
+    tdc_channel_fold #(
+        .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
+        .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP),
+        .FINE_LATENCY(FINE_LATENCY)
+    ) chan_b (
+`else
     tdc_channel #(
         .NUM_CARRY4(NUM_CARRY4), .TDL_WIDTH(TDL_WIDTH), .FINE_BITS(FINE_BITS),
         .COARSE_BITS(COARSE_BITS), .CAPTURE_LAG(CAPTURE_LAG), .TAP_SRC(TAP_SRC), .SYNC_TAP(SYNC_TAP), .DUAL_SNAP(DUAL_SNAP),
-        .FINE_LATENCY(FINE_LATENCY)
+        .FINE_LATENCY(FINE_LATENCY), .RAW_W(RAW_W)
     ) chan_b (
+`endif
         .clk          (clk200_i),
         .rst          (rst_i),
         .clear_status (clear_status),
@@ -237,7 +258,8 @@ module tdc_dual_top #(
         .valid_out    (valid_b_w),
         .ready        (ready_b_w),
         .event_in     (event_b_i),
-        .done         (done_b)
+        .done         (done_b),
+        .raw_out      ()
     );
 
     // -------------------------------------------------------------------------

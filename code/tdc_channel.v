@@ -81,7 +81,9 @@ module tdc_channel #(
     parameter integer SYNC_TAP     = 30,
     // DUAL_SNAP -- dead-zone fix (step 4): if the chosen edge is already full,
     // take the previous edge's taps AND coarse. 0 = old behaviour.
-    parameter integer DUAL_SNAP    = 1
+    parameter integer DUAL_SNAP    = 1,
+    // Width of raw_out (lowest sampled taps). Same port on tdc_channel_fold.
+    parameter integer RAW_W        = 159
 )(
     input  wire                    clk,           // clk200
     input  wire                    rst,           // active high
@@ -95,7 +97,8 @@ module tdc_channel #(
     output wire [FINE_BITS-1:0]    fine_out,      // taps climbed before that edge
     output wire                    valid_out,     // thermometer code was legal
     output wire                    ready,         // 1-cycle: outputs are settled
-    output wire                    done           // captured, locked out
+    output wire                    done,          // captured, locked out
+    output wire [RAW_W-1:0]        raw_out        // lowest RAW_W captured taps (DUMP builds)
 );
 
     // -------------------------------------------------------------------------
@@ -152,6 +155,7 @@ module tdc_channel #(
     // Taps and coarse use the SAME depth -> they describe the SAME clock edge.
     // -------------------------------------------------------------------------
     wire [TDL_WIDTH-1:0]   sampled_taps;
+    assign raw_out = sampled_taps[RAW_W-1:0];
     wire                   tap_full;
     wire                   use_prev = (DUAL_SNAP != 0) && tap_full;
 

@@ -71,7 +71,12 @@ module tdc_dual_board #(
     parameter integer RO_STAGES        = 7,   // odd. Build 7 AND 11 to cross-check
     parameter integer RO_DIV_BITS      = 10,  // event period ~ 2^10 RO periods (EVENT_SRC 3 and 4)
     parameter integer DUAL_SNAP        = 1,   // step 4: dead-zone fix, 0 = old capture
-    parameter integer ENCODER_ID       = 0    // reported in cfg: 0 = ones-counter, single edge
+`ifdef FOLD
+    parameter integer ENCODER_ID       = 1,   // 1 = folding, single edge (fold_decode)
+`else
+    parameter integer ENCODER_ID       = 0,   // reported in cfg: 0 = ones-counter, single edge
+`endif
+    parameter integer DUMP             = 0    // 1 = send raw channel-A snapshots (frame v5, 0xC3)
 )(
     input  wire        clk100,        // F14
     input  wire        rst,           // J2  btn0
@@ -87,7 +92,13 @@ module tdc_dual_board #(
 );
 
     localparam integer COARSE_BITS = 14;
+`ifdef FOLD
+    localparam integer FINE_BITS   = 10;    // fold code 0..~512 (32 + n*120 + pos)
+`else
     localparam integer FINE_BITS   = 9;     // encoder output width (0..352)
+`endif
+    localparam integer RAW_W       = 159;   // raw snapshot width carried to the DUMP path
+    wire [RAW_W-1:0] raw_a;
     localparam integer FRAME_FINE  = 11;    // frame field width
     localparam integer PHASE_BITS  = 12;
 
@@ -200,6 +211,7 @@ module tdc_dual_board #(
         .clk200       (clk200),
         .mmcm_locked  (mmcm_locked),
         .rst_sync     (rst_sync_w),
+        .raw_a        (raw_a),
         .ps_step_btn  (btn_a),   // DPS builds: btn_a = PHASE STEP
         .ps_dir_btn   (btn_b),   // DPS builds: btn_b held = decrement
         .ps_step_req  (sweep_step_req),
@@ -308,10 +320,22 @@ module tdc_dual_board #(
         end
     end
 
+    wire uart_txd_norm, dump_txd;
     uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) uart_tx_inst (
         .clk (clk200), .rst (rst200), .send (uart_send), .data (uart_byte),
-        .tx  (uart_txd), .busy (uart_busy)
+        .tx  (uart_txd_norm), .busy (uart_busy)
     );
+    // DUMP builds: the pin carries raw channel-A snapshots (frame v5) instead of
+    // the normal frame. The normal path still runs internally so re-arm
+    // (frame_done) keeps its timing.
+    generate if (DUMP != 0) begin : g_dump
+        dump_tx #(.CLKS_PER_BIT(CLKS_PER_BIT), .RAW_W(RAW_W), .FINE_BITS(FINE_BITS)) u_dump (
+            .clk (clk200), .rst (rst200), .meas_ready (meas_ready),
+            .raw (raw_a), .fine (fine_a), .valid (valid_a), .txd (dump_txd));
+    end else begin : g_nodump
+        assign dump_txd = 1'b1;
+    end endgenerate
+    assign uart_txd = (DUMP != 0) ? dump_txd : uart_txd_norm;
 
     // -------------------------------------------------------------------------
     // AUTONOMOUS DPS SWEEP  (triangle 0 -> SWEEP_STEPS-1 -> 0 ...)
