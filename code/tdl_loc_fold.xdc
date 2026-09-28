@@ -182,6 +182,9 @@ set_property LOC SLICE_X37Y128   [get_cells {core/chan_a/tdl_inst/g_c4[86].u_c4}
 set_property BEL SLICEL.CARRY4  [get_cells {core/chan_a/tdl_inst/g_c4[86].u_c4}]
 set_property LOC SLICE_X37Y129   [get_cells {core/chan_a/tdl_inst/g_c4[87].u_c4}]
 set_property BEL SLICEL.CARRY4  [get_cells {core/chan_a/tdl_inst/g_c4[87].u_c4}]
+# ============ chan_a : return LUT in the B slice ============
+set_property BEL SLICEL.A6LUT  [get_cells {core/chan_a/tdl_inst/u_ret}]
+set_property LOC SLICE_X37Y50   [get_cells {core/chan_a/tdl_inst/u_ret}]
 # ============ chan_a : tap_reg capture flops (159 cells) ============
 set_property LOC SLICE_X37Y42   [get_cells {core/chan_a/tap_snap_inst/tap_reg_reg[0]}]
 set_property BEL SLICEL.AFF     [get_cells {core/chan_a/tap_snap_inst/tap_reg_reg[0]}]
@@ -678,6 +681,9 @@ set_property LOC SLICE_X48Y128   [get_cells {core/chan_b/tdl_inst/g_c4[86].u_c4}
 set_property BEL SLICEL.CARRY4  [get_cells {core/chan_b/tdl_inst/g_c4[86].u_c4}]
 set_property LOC SLICE_X48Y129   [get_cells {core/chan_b/tdl_inst/g_c4[87].u_c4}]
 set_property BEL SLICEL.CARRY4  [get_cells {core/chan_b/tdl_inst/g_c4[87].u_c4}]
+# ============ chan_b : return LUT in the B slice ============
+set_property BEL SLICEL.A6LUT  [get_cells {core/chan_b/tdl_inst/u_ret}]
+set_property LOC SLICE_X48Y50   [get_cells {core/chan_b/tdl_inst/u_ret}]
 # ============ chan_b : tap_reg capture flops (159 cells) ============
 set_property LOC SLICE_X48Y42   [get_cells {core/chan_b/tap_snap_inst/tap_reg_reg[0]}]
 set_property BEL SLICEL.AFF     [get_cells {core/chan_b/tap_snap_inst/tap_reg_reg[0]}]

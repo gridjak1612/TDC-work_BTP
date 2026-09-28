@@ -28,6 +28,7 @@ foreach ch {chan_a chan_b} {
     set rl [get_property LOC $ret]
     puts "$ch: B at $bl, u_ret at $rl ([get_property BEL $ret])"
     if {$bl ne $rl} { lappend bad "$ch: u_ret not in the B slice" }
+    if {[get_property BEL $ret] ne "SLICEL.A6LUT"} { lappend bad "$ch: u_ret not on A6LUT" }
 }
 puts "impl_1 WNS: [get_property STATS.WNS [get_runs impl_1]] ns"
 if {[llength $bad] == 0} {

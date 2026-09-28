@@ -35,6 +35,12 @@ for name, x in CHAINS:
         c = f"core/{name}/tdl_inst/g_c4[{n}].u_c4"
         L.append(f"set_property LOC SLICE_X{x}Y{Y0+n}   [get_cells {{{c}}}]")
         L.append(f"set_property BEL SLICEL.CARRY4  [get_cells {{{c}}}]")
+    # Return LUT: force it into the B slice (CARRY4 #8), A6LUT, so its O6 feeds
+    # S0 directly. Left free, the placer parked it ~15 rows away and inserted a
+    # pass-through LUT in the B slice: a longer return path than the probe measured.
+    L.append(f"# ============ {name} : return LUT in the B slice ============")
+    L.append(f"set_property BEL SLICEL.A6LUT  [get_cells {{core/{name}/tdl_inst/u_ret}}]")
+    L.append(f"set_property LOC SLICE_X{x}Y{Y0+8}   [get_cells {{core/{name}/tdl_inst/u_ret}}]")
     L.append(f"# ============ {name} : tap_reg capture flops ({LAUNCH_W+FOLD_W+NCNT} cells) ============")
     for j in range(LAUNCH_W + FOLD_W + NCNT):
         t = sampled_to_tap(j)
@@ -42,4 +48,4 @@ for name, x in CHAINS:
         L.append(f"set_property LOC SLICE_X{x}Y{Y0 + t // 4}   [get_cells {{{c}}}]")
         L.append(f"set_property BEL SLICEL.{FF[t % 4]}     [get_cells {{{c}}}]")
 open("tdl_loc_fold.xdc", "w").write("\n".join(L) + "\n")
-print(f"tdl_loc_fold.xdc: {2 * len(CHAINS) * (NUM_C4 + LAUNCH_W + FOLD_W + NCNT)} LOC/BEL lines")
+print(f"tdl_loc_fold.xdc: {2 * len(CHAINS) * (NUM_C4 + LAUNCH_W + FOLD_W + NCNT + 1)} LOC/BEL lines")
