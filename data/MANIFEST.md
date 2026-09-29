@@ -26,3 +26,23 @@ A LUT is only valid for the bitstream (placement) it was built from.
 | 0924e_0dcbbe8_ro7_sync30_ds.csv | 0dcbbe8, independent eval run for calib_report | 2.16 M frames; residual DNL rms 0.02 LSB, residual INL <= 7 ps, sigma 10.34 ps/ch |
 | 0925_multi_ro7.csv + 0925_multi_dps.csv | multi-source bitstream (EVENT_SRC=4), SW2 only (SW1 faulty) | RO7 2.99M, DPS 1.40M, dead zone 0 in both. Same-bitstream CD vs DPS: scale 0.5 %, shape +/-25 ps, CD LUT on DPS data 14.2-14.9 ps vs 11.2-12.1 ps |
 | 0925_m3_ro7.csv + 0925_m3_ro11.csv | multi-source build, source select on SW2+SW3 (T2) | RO7 vs RO11 same bitstream: corr 1.000, 0.30 ps/bin, 0.00 % scale, +/-4 ps shape -> RO hit uniformity validated |
+
+## Folding step 2 (K=64, single edge, fold 136) — PASSED, commit 8f9942e
+
+## Folding step 2 (K=64, single edge, fold 136) — PASSED, commit 8f9942e
+
+Bitstream (D:\vivado_work\bitstreams\):
+  fold2_8f9942e.bit    FOLD=1 DUMP=0 EVENT_SRC=4, tdl_loc_fold.xdc, 175 sampled taps/ch,
+                       placement PASS (1056 constraints)
+
+Captures (data\raw\):
+  dump_fold2_ro7.csv        DUMP=1 raw snapshots, RO7, 30 s, 199533 frames, MODEL MATCH PASS
+  fold2_8f9942e_ro7.csv     RO7,  150 s, 2990810 frames, 0 railed, ~1.0% bubble-invalid
+  fold2_8f9942e_ro11.csv    RO11, 150 s, 2984865 frames  (eval set)
+
+LUTs (data\):
+  lut_fold2_ro7_a.csv   lut_fold2_ro7_b.csv   (RO7 code-density, --rail-max 1023)
+
+Result (RO7 LUT on RO11): 11.53 ps rms/ch (baseline 10.15), 0.000% outliers>200ps,
+  residual DNL 0.020/0.019 LSB rms, residual INL <=7.5 ps, dead zone 0.
+  Laps uniform (sigma_pair 16-17 ps every lap pair). LUT valid only for this bitstream.
