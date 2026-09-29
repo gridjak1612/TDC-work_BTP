@@ -8,17 +8,36 @@ snapshot generator with a physical model of the folding chain.
     python fold_model.py --check fold_vectors.txt fold_tb_out.txt
         compares the testbench's outputs with the model (used by tb_fold_decode).
 
-Geometry defaults match tdc_channel_fold: LAUNCH_W 32, FOLD_W 120, NCNT 7,
-CNT_STEP 32, chain 352 taps, K 64 (lap = FOLD_W taps by construction).
+Geometry (rev 2, fold 136): LAUNCH_W 32, FOLD_W 136 (B = tap 32 .. E = tap 167),
+NCNT 7 counting taps at 168 + 30 j, chain 352 taps. Laps are ~116-131 taps
+depending on chain and polarity, always shorter than the fold, so two edges can
+briefly share the fold (overlap) but the fold is never empty (no gap).
+
+DECODE RULE (mirrors fold_decode.v). Every edge still inside the fold is a
+valid time reference, so on a lap boundary the decoder reports the OLDER
+edge's position (its lap is what the counting taps say); the newer edge, if
+already at B, is only used to find where the older one is.
+  n     = transitions along {fold[E], cnt[0..6]}   (edges that left the fold)
+  ref   = 1 if n even else 0                      (level under edge n)
+  x     = fold XNOR ref                           (1s under edge n)
+          single edge : x = 1^p 0^rest            pos = popcount(x) = p
+          front at B  : x = all 0                 pos = 0
+          fold empty  : x = all 1                 pos = FOLD_W (= next lap, pos 0)
+          overlap     : x = 0^a 1^(q-a) 0^rest    (newer edge at a, older at q >= FOLD_W-OVL_TOP)
+                        pos = q = popcount(x) + FOLD_W - popcount(x | TOP)  (TOP = top OVL_TOP bits)
+  ovl   = x[0] == 0 and x not all 0
+  code  = launch popcount if front still in launch, else LAUNCH_W + n*FOLD_W + pos
+  valid = launch clean step & (in_launch | (x has <= 1 falling transition
+          & (x[top] == 0 | x all 1) & (!ovl | x[FOLD_W-OVL_TOP-1] == 1) & n <= N_MAX))
 """
 import argparse, random, sys
 
-LAUNCH_W, FOLD_W, NCNT, CNT_STEP, CHAIN = 32, 120, 7, 32, 352
-N_MAX, FINE_BITS = 4, 10
+LAUNCH_W, FOLD_W, NCNT, CNT_STEP, CHAIN = 32, 136, 7, 30, 352
+OVL_TOP, N_MAX, FINE_BITS = 28, 4, 10
 SW = LAUNCH_W + FOLD_W + NCNT
+E_TAP = LAUNCH_W + FOLD_W - 1
 
 
-# ----------------------------------------------------------- RTL mirror
 def majority5(bits):
     w = len(bits)
     out = [0] * w
@@ -33,8 +52,7 @@ def majority5(bits):
 
 def therm_valid(bits):
     """thermometer_validator_piped: at most one 1->0 transition."""
-    t = sum(1 for i in range(len(bits) - 1) if bits[i] and not bits[i+1])
-    return t <= 1
+    return sum(1 for i in range(len(bits) - 1) if bits[i] and not bits[i+1]) <= 1
 
 
 def decode(bits):
@@ -45,57 +63,70 @@ def decode(bits):
     seq = [fold[-1]] + cnt
     n = sum(seq[j] ^ seq[j+1] for j in range(NCNT))
     ref = 0 if (n & 1) else 1
-    x = [b ^ ref for b in fold]
-    launch_cnt = sum(launch)
+    x = [1 - (b ^ ref) for b in fold]               # XNOR: 1s under edge n
     ones = sum(x)
+    xt = x[:FOLD_W - OVL_TOP] + [1] * OVL_TOP        # x | TOP
+    ones_t = sum(xt)
+    all_zero, all_ones = (ones == 0), (ones == FOLD_W)
+    ovl = (x[0] == 0) and not all_zero
+    pos = (ones + FOLD_W - ones_t) if ovl else ones
+    launch_cnt = sum(launch)
     in_launch = launch_cnt < LAUNCH_W
     if in_launch:
         fine = launch_cnt
     else:
-        full = LAUNCH_W + n * FOLD_W + (FOLD_W - ones)
-        fine = min(full, (1 << FINE_BITS) - 1)
+        fine = min(LAUNCH_W + n * FOLD_W + pos, (1 << FINE_BITS) - 1)
+    x_ok = therm_valid(x) and (x[-1] == 0 or all_ones) and (not ovl or x[FOLD_W - OVL_TOP - 1] == 1)
     valid = therm_valid(launch) and (launch[0] == 1 or launch_cnt == 0) and \
-        (in_launch or (therm_valid(x) and (x[-1] == 1 or ones == 0) and n <= N_MAX))
+        (in_launch or (x_ok and n <= N_MAX))
     return fine, int(valid)
 
 
+def code_to_taps(code, laps):
+    """Elapsed time (taps) implied by a code, for the tracking self-check."""
+    if code < LAUNCH_W:
+        return code
+    n, pos = divmod(code - LAUNCH_W, FOLD_W)
+    return LAUNCH_W + sum(laps[m % len(laps)] for m in range(n)) + pos
+
+
 # ----------------------------------------------------------- physical model
-def snapshot(t_taps, rng, bubble_p=0.0, jitter=0.0):
-    """Chain state t_taps tap-delays after the hit (float). Returns SW bits.
-    Edges: front enters the fold at LAUNCH_W; edge m enters at LAUNCH_W + m*FOLD_W
-    (lap = FOLD_W taps). Level at a position = number of edges past it, mod 2."""
-    bits = []
-    for i in range(LAUNCH_W):                       # launch: plain step
-        bits.append(1 if t_taps > i else 0)
-    def level(pos_from_B):
+def snapshot(t_taps, rng, laps=(120, 117, 131, 124), bubble_p=0.0):
+    """Chain state t_taps tap-delays after the hit. Edge m enters B at
+    LAUNCH_W + sum(laps[:m]); each edge then moves one tap per tap-delay.
+    Level at a position = number of edges past it, mod 2 (pre-hit level 0).
+    Returns SW bits: launch, fold, counting."""
+    bits = [1 if t_taps > i else 0 for i in range(LAUNCH_W)]
+    starts = []
+    s = LAUNCH_W
+    for m in range(8):
+        starts.append(s)
+        s += laps[m % len(laps)]
+
+    def level(tap):
         passed = 0
-        m = 0
-        while True:
-            p = t_taps - LAUNCH_W - m * FOLD_W      # edge m position from B
+        for st in starts:
+            p = t_taps - st                 # edge position from B
             if p <= 0:
                 break
-            if p > pos_from_B + rng.uniform(-jitter, jitter):
+            if LAUNCH_W + p > tap:
                 passed += 1
-            m += 1
         return passed & 1
     for i in range(FOLD_W):
-        bits.append(level(i))
+        bits.append(level(LAUNCH_W + i))
     for j in range(NCNT):
-        bits.append(level(FOLD_W + CNT_STEP * j))
+        bits.append(level(LAUNCH_W + FOLD_W + CNT_STEP * j))
     if bubble_p > 0:
-        # Real bubbles: taps within one position of a PROPAGATING edge sample
-        # metastably. Flip at most one tap per edge, never elsewhere.
-        m = 0
-        while True:
-            p = t_taps - m * FOLD_W                 # absolute tap index of edge m
-            if p <= 0 or (m > 0 and p <= LAUNCH_W):
+        for st in starts:
+            p = t_taps - st
+            if p <= 0:
                 break
+            tap = LAUNCH_W + p               # absolute tap of this edge
             if rng.random() < bubble_p:
-                i = int(round(p + rng.uniform(-1.0, 1.0)))
-                lo = 1 if m == 0 else LAUNCH_W      # return edges start AT B
+                i = int(round(tap + rng.uniform(-1.5, 1.5)))
+                lo = 1 if st == LAUNCH_W else LAUNCH_W
                 if lo <= i < LAUNCH_W + FOLD_W - 1:
                     bits[i] ^= 1
-            m += 1
     return bits
 
 
@@ -114,32 +145,34 @@ def from_hex(s):
 def gen(path, n, seed):
     rng = random.Random(seed)
     lines, bad_track, n_valid = [], 0, 0
-    t_max = CHAIN - 8                                # keep the front on the chain
+    t_max = CHAIN - 8
+    laps_sets = [(120, 117, 131, 124), (120, 120, 120, 120), (117, 116, 118, 117), (131, 128, 131, 130)]
     for i in range(n):
+        laps = laps_sets[i % len(laps_sets)]
         kind = rng.random()
         if kind < 0.05:
-            t = rng.uniform(-20, 0)                  # before the hit
+            t = rng.uniform(-20, 0)
         elif kind < 0.15:
-            t = rng.uniform(0, LAUNCH_W)             # front in launch
-        elif kind < 0.25:                            # lap boundaries
+            t = rng.uniform(0, LAUNCH_W)
+        elif kind < 0.35:                            # lap boundaries incl. overlaps
             m = rng.randrange(0, 3)
-            t = LAUNCH_W + m * FOLD_W + rng.uniform(-1.5, 1.5)
+            t = LAUNCH_W + sum(laps[:m]) + rng.uniform(-3, 25)
         else:
             t = rng.uniform(0, t_max)
         bubble_p = 0.0 if i % 2 == 0 else 0.3
-        bits = snapshot(t, rng, bubble_p=bubble_p, jitter=0.0)
+        bits = snapshot(t, rng, laps=laps, bubble_p=bubble_p)
         fine, valid = decode(bits)
-        # Concept check: a valid code must track elapsed time (in taps) within
-        # the bubble filter's reach. Boundary and pre-hit cases are exempt.
-        # (> 4, not > 3: the majority filter's top-boundary rule can pull an edge
-        #  in the last three fold taps up to E when one of them is a bubble.)
-        if valid and t > 0 and abs(fine - t) > 4:
-            bad_track += 1
+        if valid and t > 0:
+            t_est = code_to_taps(fine, laps)
+            if abs(t_est - t) > 4:
+                bad_track += 1
+                if bad_track <= 5:
+                    print(f"  track: t={t:.2f} laps={laps} code={fine} -> t_est={t_est}")
         n_valid += valid
         lines.append(f"{to_hex(bits)} {fine} {valid}")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
-    print(f"{n} vectors -> {path}: {n_valid} valid, {bad_track} valid codes off by >4 taps")
+    print(f"{n} vectors -> {path}: {n_valid} valid, {bad_track} valid codes off by >4 taps in time")
     return bad_track == 0
 
 
@@ -160,10 +193,8 @@ def check(vec_path, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gen")
-    ap.add_argument("--n", type=int, default=3000)
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--check", nargs=2)
+    ap.add_argument("--gen"); ap.add_argument("--n", type=int, default=3000)
+    ap.add_argument("--seed", type=int, default=1); ap.add_argument("--check", nargs=2)
     a = ap.parse_args()
     if a.gen:
         sys.exit(0 if gen(a.gen, a.n, a.seed) else 1)

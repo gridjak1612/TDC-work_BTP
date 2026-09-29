@@ -8,7 +8,7 @@
 //   Add fold_vectors.txt to the sim_1 fileset so Vivado copies it next to xsim.
 // =============================================================================
 module tb_fold_decode;
-    localparam integer LAUNCH_W = 32, FOLD_W = 120, NCNT = 7, FINE_BITS = 10;
+    localparam integer LAUNCH_W = 32, FOLD_W = 136, NCNT = 7, FINE_BITS = 10;
     localparam integer SW = LAUNCH_W + FOLD_W + NCNT;
     localparam integer LATENCY = 10;
     localparam integer MAXV = 8192;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dump_taps.py -- reads frame v5 (DUMP=1 builds): raw channel-A folding snapshots.
 
-Frame (26 bytes): 0xC3 | raw[159:0] MSB first | fine[15:8] fine[7:0] | valid | seq | CRC-8
+Frame (28 bytes): 0xC3 | raw[175:0] MSB first | fine[15:8] fine[7:0] | valid | seq | CRC-8
 Checks the board's fine/valid against fold_model.decode on every snapshot and
 prints what the fold really looks like. Run from code/ (needs fold_model.py).
 
@@ -12,7 +12,7 @@ import argparse, csv, sys, time
 from collections import Counter
 import fold_model as fm
 
-HEADER, FLEN = 0xC3, 26
+HEADER, FLEN = 0xC3, 28
 
 
 def crc8(data):
@@ -30,12 +30,12 @@ def parse(buf):
         if buf[0] != HEADER:
             buf.pop(0); skipped += 1; continue
         f = bytes(buf[:FLEN])
-        if crc8(f[:25]) != f[25]:
+        if crc8(f[:27]) != f[27]:
             bad += 1; buf.pop(0); continue
         del buf[:FLEN]
-        raw = int.from_bytes(f[1:21], "big")
-        fine = ((f[21] << 8) | f[22]) & 0x3FF
-        out.append(dict(raw=f"{raw & ((1 << fm.SW) - 1):040x}", fine=fine, valid=f[23] & 1, seq=f[24]))
+        raw = int.from_bytes(f[1:23], "big")
+        fine = ((f[23] << 8) | f[24]) & 0x3FF
+        out.append(dict(raw=f"{raw & ((1 << fm.SW) - 1):0{(fm.SW + 3) // 4}x}", fine=fine, valid=f[25] & 1, seq=f[26]))
     return out, skipped, bad
 
 
@@ -76,6 +76,34 @@ def analyse(rows, show):
             print(f"seq {r['seq']:3d} fine {r['fine']:4d} valid {r['valid']}  {as_string(bits)}")
     n = len(rows)
     print(f"\n{n} snapshots: valid {n_valid} ({100 * n_valid / n:.1f}%), board/model mismatches {mism}")
+    # ---- per-lap detail: position range, dead positions, raw-transition histogram
+    per_lap = {}
+    for r in rows:
+        if not r["valid"] or r["fine"] < fm.LAUNCH_W:
+            continue
+        lap, pos = divmod(r["fine"] - fm.LAUNCH_W, fm.FOLD_W)
+        d = per_lap.setdefault(lap, dict(pos=Counter(), tr=Counter()))
+        d["pos"][pos] += 1
+        fold = fm.from_hex(r["raw"])[fm.LAUNCH_W:fm.LAUNCH_W + fm.FOLD_W]
+        d["tr"][transitions(fold)] += 1
+    print("\nper lap (n = lap index, pos = position in fold):")
+    for lap in sorted(per_lap):
+        d = per_lap[lap]
+        seen = sorted(d["pos"])
+        hits = sum(d["pos"].values())
+        dead = [p for p in range(seen[0], seen[-1] + 1) if p not in d["pos"]]
+        share = hits / max(1, sum(sum(x["pos"].values()) for x in per_lap.values()))
+        tr = ", ".join(f"{k}:{100 * v / hits:.0f}%" for k, v in sorted(d["tr"].items()) if v / hits >= 0.005)
+        print(f"  n={lap}: {hits:6d} hits ({100 * share:.1f}%)  pos {seen[0]}..{seen[-1]}  "
+              f"dead positions {len(dead)}: {dead if len(dead) <= 24 else str(dead[:24]) + '...'}")
+        print(f"        raw transitions {tr}")
+    # lap length estimate: lap share of the period, ignoring the last (truncated) lap
+    tot = sum(r["valid"] for r in rows)
+    laps_sorted = sorted(per_lap)
+    for lap in laps_sorted[:-1]:
+        hits = sum(per_lap[lap]["pos"].values())
+        print(f"  lap {lap} share of all valid hits {100 * hits / tot:.1f}% -> ~{5000 * hits / tot:.0f} ps "
+              f"(fold = {fm.FOLD_W} taps ~ {fm.FOLD_W * 17.26:.0f} ps at 17.26 ps/tap)")
     print("raw transitions in the fold (before bubble filter):",
           ", ".join(f"{k}: {v}" for k, v in sorted(raw_edges.items())))
     print(f"bubbles removed by the filter: {bubbles} ({bubbles / n:.2f} per snapshot)")

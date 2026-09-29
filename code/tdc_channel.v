@@ -83,7 +83,7 @@ module tdc_channel #(
     // take the previous edge's taps AND coarse. 0 = old behaviour.
     parameter integer DUAL_SNAP    = 1,
     // Width of raw_out (lowest sampled taps). Same port on tdc_channel_fold.
-    parameter integer RAW_W        = 159
+    parameter integer RAW_W        = 175
 )(
     input  wire                    clk,           // clk200
     input  wire                    rst,           // active high

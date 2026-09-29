@@ -55,7 +55,7 @@ module tdc_dual_top #(
     parameter integer TAP_SRC        = 0,    // 1 = XORCY probe build
     parameter integer SYNC_TAP       = 30,   // 0 = old raw-event sync
     parameter integer DUAL_SNAP      = 1,    // step 4 dead-zone fix
-    parameter integer RAW_W          = 159   // raw snapshot width (FOLD: 32+120+7)
+    parameter integer RAW_W          = 175   // raw snapshot width (FOLD rev 2: 32+136+7)
 )(
     input  wire                   clk100,
     input  wire                   rst,

@@ -1,14 +1,14 @@
 `timescale 1ns/1ps
 // =============================================================================
 // dump_tx -- frame v5: raw channel-A snapshot for folding bring-up.
-//   0xC3 | raw[159:0] MSB first (20 bytes, bit 159 = 0) | fine[15:8] | fine[7:0]
-//        | {7'b0, valid} | seq | CRC-8 (poly 0x07, init 0, over the 25 bytes before it)
-//   26 bytes = 130 us at 2 Mbaud. A meas_ready that arrives while a frame is
+//   0xC3 | raw[175:0] MSB first (22 bytes, bit 175 = 0) | fine[15:8] | fine[7:0]
+//        | {7'b0, valid} | seq | CRC-8 (poly 0x07, init 0, over the 27 bytes before it)
+//   28 bytes = 140 us at 2 Mbaud. A meas_ready that arrives while a frame is
 //   still going out is dropped (seq shows the gaps).
 // =============================================================================
 module dump_tx #(
     parameter integer CLKS_PER_BIT = 100,
-    parameter integer RAW_W        = 159,
+    parameter integer RAW_W        = 175,
     parameter integer FINE_BITS    = 10
 )(
     input  wire                 clk,
@@ -19,28 +19,28 @@ module dump_tx #(
     input  wire                 valid,
     output wire                 txd
 );
-    localparam integer NB = 26;
-    function [7:0] crc8_200;
-        input [199:0] d;
+    localparam integer NB = 28;
+    function [7:0] crc8_216;
+        input [215:0] d;
         integer i;
         reg [7:0] c;
         begin
             c = 8'h00;
-            for (i = 199; i >= 0; i = i - 1)
+            for (i = 215; i >= 0; i = i - 1)
                 c = {c[6:0], 1'b0} ^ ((c[7] ^ d[i]) ? 8'h07 : 8'h00);
-            crc8_200 = c;
+            crc8_216 = c;
         end
     endfunction
 
     reg  [7:0]   seq;
-    wire [159:0] raw160 = {{(160-RAW_W){1'b0}}, raw};
+    wire [175:0] raw176 = {{(176-RAW_W){1'b0}}, raw};
     wire [15:0]  fine16 = fine;
-    wire [199:0] body   = {8'hC3, raw160, fine16, 7'd0, valid, seq};
-    wire [207:0] frame  = {body, crc8_200(body)};
+    wire [215:0] body   = {8'hC3, raw176, fine16, 7'd0, valid, seq};
+    wire [223:0] frame  = {body, crc8_216(body)};
 
     reg        send, sending;
     reg [7:0]  byte_r;
-    reg [207:0] sr;
+    reg [223:0] sr;
     reg [4:0]  nleft;
     wire       busy;
 
@@ -54,7 +54,7 @@ module dump_tx #(
             end else if (sending && !busy && !send) begin
                 if (nleft == 0) sending <= 1'b0;
                 else begin
-                    byte_r <= sr[207:200]; sr <= {sr[199:0], 8'h00};
+                    byte_r <= sr[223:216]; sr <= {sr[215:0], 8'h00};
                     send <= 1'b1; nleft <= nleft - 1'b1;
                 end
             end

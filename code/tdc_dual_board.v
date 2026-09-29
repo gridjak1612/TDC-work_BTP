@@ -97,7 +97,7 @@ module tdc_dual_board #(
 `else
     localparam integer FINE_BITS   = 9;     // encoder output width (0..352)
 `endif
-    localparam integer RAW_W       = 159;   // raw snapshot width carried to the DUMP path
+    localparam integer RAW_W       = 175;   // raw snapshot width carried to the DUMP path
     wire [RAW_W-1:0] raw_a;
     localparam integer FRAME_FINE  = 11;    // frame field width
     localparam integer PHASE_BITS  = 12;

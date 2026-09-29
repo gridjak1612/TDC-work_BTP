@@ -4,7 +4,7 @@
 //
 // Drop-in for tdc_channel (same ports, FINE_BITS = 10). Differences:
 //   single_tdl        -> fold_tdl        (return path D -> B, loop_en gate)
-//   352 sampled taps  -> 159: launch 0..31, fold 32..151, counting 152+32j
+//   352 sampled taps  -> 175: launch 0..31, fold 32..167, counting 168+30j
 //   snapshot_pipeline -> snapshot_fold   (DUAL_SNAP decides on launch tap 8)
 //   bubble+popcount   -> fold_decode     (lap count + position, latency 10)
 //   loop_en flop      : closed only while armed AND the event line has been
@@ -12,7 +12,8 @@
 //   raw_out           : the captured 159-bit snapshot (for the DUMP build)
 //
 // Geometry (from the return-path probe, tau 17.26 ps/tap):
-//   B = tap 32, D = tap 96 (K = 64), E = tap 151 (fold 120 taps), lap 2.06 ns.
+//   B = tap 32, D = tap 96 (K = 64), E = tap 167 (fold 136 taps; laps measured
+//   112-131 taps, so the fold is never empty and lap boundaries overlap).
 // The coarse counter, capture controller and pairing are untouched.
 // =============================================================================
 module tdc_channel_fold #(
@@ -26,9 +27,10 @@ module tdc_channel_fold #(
     parameter integer DUAL_SNAP    = 1,
     parameter integer B_C4         = 8,    // B = tap 32
     parameter integer K            = 64,   // B -> D
-    parameter integer FOLD_W       = 120,  // B .. E
+    parameter integer FOLD_W       = 136,  // B .. E (rev 2: > longest lap)
     parameter integer NCNT         = 7,
-    parameter integer CNT_STEP     = 32,
+    parameter integer CNT_STEP     = 30,   // 168 + 30j <= 348
+    parameter integer OVL_TOP      = 28,   // fold_decode: older edge sits above FOLD_W-OVL_TOP in an overlap
     parameter integer HIT_TAP      = 8
 )(
     input  wire                    clk,
@@ -103,7 +105,7 @@ module tdc_channel_fold #(
     assign raw_out = sampled;
 
     // ---------------------------------------------------------------- decode
-    fold_decode #(.LAUNCH_W(LAUNCH_W), .FOLD_W(FOLD_W), .NCNT(NCNT), .FINE_BITS(FINE_BITS)) dec_inst (
+    fold_decode #(.LAUNCH_W(LAUNCH_W), .FOLD_W(FOLD_W), .NCNT(NCNT), .OVL_TOP(OVL_TOP), .FINE_BITS(FINE_BITS)) dec_inst (
         .clk(clk), .rst(rst), .sampled(sampled), .fine(fine_out), .valid(valid_out));
 
     reg [FINE_LATENCY-1:0] cap_pipe;

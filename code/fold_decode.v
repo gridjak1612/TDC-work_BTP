@@ -1,46 +1,56 @@
 `timescale 1ns/1ps
 // =============================================================================
-// fold_decode -- turns one sampled folding snapshot into a fine code.
+// fold_decode (rev 2) -- turns one sampled folding snapshot into a fine code.
 //
 // Snapshot layout (SAMPLED_W = LAUNCH_W + FOLD_W + NCNT bits), LSB first:
 //   [LAUNCH_W-1:0]                 launch taps 0..LAUNCH_W-1   (monotonic step)
-//   [LAUNCH_W+FOLD_W-1:LAUNCH_W]   fold taps B..E              (one edge, alternating polarity)
+//   [LAUNCH_W+FOLD_W-1:LAUNCH_W]   fold taps B..E              (alternating polarity per lap)
 //   [top NCNT bits]                counting taps, sparse, E+CNT_STEP*j
 //
-// Lap count n     = transitions along {fold[E], cnt[0], cnt[1], ...}
-// Reference level = level right under the latest edge = 1 for even n, 0 for odd n
-// x = fold ^ ref  -> 0s from B up to the edge, then 1s   (a thermometer code)
-// pos             = FOLD_W - popcount(x)
+// Laps (116..131 taps on this board) are SHORTER than the fold (136), so the
+// fold is never empty but two edges can share it at a lap boundary. Every edge
+// still inside the fold is a valid time reference, so the decoder reports the
+// OLDER edge (lap n from the counting taps); the newer edge, if already at B,
+// is only used to locate the older one. (Rev 1 summed the two into a bogus
+// position, and the 120-tap fold left gaps on chain B.)
 //
-// code = launch_popcount                        if the front is still in the launch section
-//      = LAUNCH_W + n*FOLD_W + pos              otherwise
-// Adjacent across lap boundaries: an off-by-one in n at the boundary lands on
-// a neighbouring code, never in another lap.
+//   n   = transitions along {fold[E], cnt[0..]}      edges that left the fold
+//   ref = 1 for even n, else 0                       level under edge n
+//   x   = fold XNOR ref                              1s under edge n
+//       single edge  x = 1^p 0^...                   pos = popcount(x)
+//       front at B   x = all 0                       pos = 0
+//       fold empty   x = all 1                       pos = FOLD_W  (= next lap pos 0)
+//       overlap      x = 0^a 1^(q-a) 0^...           newer edge at a, older at q >= FOLD_W-OVL_TOP
+//                    pos = q = popcount(x) + FOLD_W - popcount(x | TOP)
+//   ovl = ~x[0] & ~(x all 0)
+//   code = launch popcount (front still in launch)  else  LAUNCH_W + n*FOLD_W + pos
+//   valid = launch clean step & (in_launch |
+//           (x has <= 1 falling transition & (x[top]==0 | x all 1)
+//            & (~ovl | x[FOLD_W-OVL_TOP-1]) & n <= N_MAX))
 //
-// valid = launch is a clean step
-//       & (front in launch | (x is 0..01..1  &  n <= N_MAX))
-//   x all-0 (edge exactly at E) is accepted: pos = FOLD_W = next lap's pos 0.
-//
-// Latency (clk cycles, input -> fine/valid): 1 (bubble) + 1 (xor) + 7 (popcount)
-//   + 1 (combine) = 10.  Must be < FINE_LATENCY of the channel (12).
+// Latency: 1 (bubble) + 1 (xor) + 7 (popcount) + 1 (combine) = 10 < FINE_LATENCY (12).
 // Reference model: fold_model.py (bit-exact, same majority filter).
 // =============================================================================
 module fold_decode #(
     parameter integer LAUNCH_W  = 32,
-    parameter integer FOLD_W    = 120,
+    parameter integer FOLD_W    = 136,
     parameter integer NCNT      = 7,
+    parameter integer OVL_TOP   = 28,
     parameter integer N_MAX     = 4,
     parameter integer FINE_BITS = 10
 )(
-    input  wire                          clk,
-    input  wire                          rst,
+    input  wire                            clk,
+    input  wire                            rst,
     input  wire [LAUNCH_W+FOLD_W+NCNT-1:0] sampled,
-    output reg  [FINE_BITS-1:0]          fine,
-    output reg                           valid
+    output reg  [FINE_BITS-1:0]            fine,
+    output reg                             valid
 );
     localparam integer SW = LAUNCH_W + FOLD_W + NCNT;
     localparam integer PC = 7;                     // ones_counter_encoder_piped latency
     localparam integer VL = 3;                     // thermometer_validator_piped latency
+    localparam integer LW = 6;                     // launch count 0..32
+    localparam integer FW = 8;                     // fold count 0..136
+    localparam [FOLD_W-1:0] TOP = {{OVL_TOP{1'b1}}, {(FOLD_W-OVL_TOP){1'b0}}};
 
     // ------------------------------------------------------------ stage A
     wire [LAUNCH_W-1:0] launch_raw = sampled[LAUNCH_W-1:0];
@@ -54,7 +64,7 @@ module fold_decode #(
 
     reg [LAUNCH_W-1:0] launch_a;
     reg [FOLD_W-1:0]   fold_a;
-    reg [NCNT:0]       seq_a;                      // {cnt, fold[E]}
+    reg [NCNT:0]       seq_a;
     always @(posedge clk) begin
         if (rst) begin launch_a <= 0; fold_a <= 0; seq_a <= 0; end
         else begin
@@ -75,58 +85,67 @@ module fold_decode #(
     wire ref_c = ~n_c[0];
 
     reg [LAUNCH_W-1:0] launch_b;
-    reg [FOLD_W-1:0]   x_b;
+    reg [FOLD_W-1:0]   x_b, xt_b;
     reg [3:0]          n_b;
     always @(posedge clk) begin
-        if (rst) begin launch_b <= 0; x_b <= 0; n_b <= 0; end
+        if (rst) begin launch_b <= 0; x_b <= 0; xt_b <= 0; n_b <= 0; end
         else begin
             launch_b <= launch_a;
-            x_b      <= fold_a ^ {FOLD_W{ref_c}};
+            x_b      <= fold_a ~^ {FOLD_W{ref_c}};
+            xt_b     <= (fold_a ~^ {FOLD_W{ref_c}}) | TOP;
             n_b      <= n_c;
         end
     end
 
     // ------------------------------------------------------------ stage C
-    localparam integer LW = 6;                     // 0..32
-    localparam integer FW = 7;                     // 0..120
     wire [LW-1:0] launch_cnt;
-    wire [FW-1:0] fold_ones;
-    wire          launch_ok, fold_ok;
+    wire [FW-1:0] ones, ones_t;
+    wire          launch_ok, x_ok;
 
     ones_counter_encoder_piped #(.INPUT_WIDTH(LAUNCH_W), .OUTPUT_WIDTH(LW)) pc_l (
         .clk(clk), .rst(rst), .thermometer_in(launch_b), .binary_out(launch_cnt));
     ones_counter_encoder_piped #(.INPUT_WIDTH(FOLD_W), .OUTPUT_WIDTH(FW)) pc_f (
-        .clk(clk), .rst(rst), .thermometer_in(x_b), .binary_out(fold_ones));
+        .clk(clk), .rst(rst), .thermometer_in(x_b), .binary_out(ones));
+    ones_counter_encoder_piped #(.INPUT_WIDTH(FOLD_W), .OUTPUT_WIDTH(FW)) pc_t (
+        .clk(clk), .rst(rst), .thermometer_in(xt_b), .binary_out(ones_t));
     thermometer_validator_piped #(.WIDTH(LAUNCH_W)) va_l (
         .clk(clk), .rst(rst), .thermometer_in(launch_b), .valid(launch_ok));
     thermometer_validator_piped #(.WIDTH(FOLD_W)) va_f (
-        .clk(clk), .rst(rst), .thermometer_in(x_b), .valid(fold_ok));
+        .clk(clk), .rst(rst), .thermometer_in(x_b), .valid(x_ok));
 
     // Align the 3-cycle validators and the side bits with the 7-cycle popcounts.
-    reg [PC-VL-1:0] lok_d, fok_d;
+    reg [PC-VL-1:0] lok_d, xok_d;
     reg [3:0]       n_d   [0:PC-1];
-    reg             xt_d  [0:PC-1];                // x[FOLD_W-1]
+    reg             x0_d  [0:PC-1];                // x[0]
+    reg             xtop_d[0:PC-1];                // x[FOLD_W-1]
+    reg             xov_d [0:PC-1];                // x[FOLD_W-OVL_TOP-1]
     reg             l0_d  [0:PC-1];                // launch[0]
     integer k;
     always @(posedge clk) begin
         if (rst) begin
-            lok_d <= 0; fok_d <= 0;
-            for (k = 0; k < PC; k = k + 1) begin n_d[k] <= 0; xt_d[k] <= 0; l0_d[k] <= 0; end
+            lok_d <= 0; xok_d <= 0;
+            for (k = 0; k < PC; k = k + 1) begin
+                n_d[k] <= 0; x0_d[k] <= 0; xtop_d[k] <= 0; xov_d[k] <= 0; l0_d[k] <= 0;
+            end
         end else begin
             lok_d <= {lok_d[PC-VL-2:0], launch_ok};
-            fok_d <= {fok_d[PC-VL-2:0], fold_ok};
-            n_d[0]  <= n_b;  xt_d[0] <= x_b[FOLD_W-1];  l0_d[0] <= launch_b[0];
+            xok_d <= {xok_d[PC-VL-2:0], x_ok};
+            n_d[0] <= n_b; x0_d[0] <= x_b[0]; xtop_d[0] <= x_b[FOLD_W-1];
+            xov_d[0] <= x_b[FOLD_W-OVL_TOP-1]; l0_d[0] <= launch_b[0];
             for (k = 1; k < PC; k = k + 1) begin
-                n_d[k] <= n_d[k-1]; xt_d[k] <= xt_d[k-1]; l0_d[k] <= l0_d[k-1];
+                n_d[k] <= n_d[k-1]; x0_d[k] <= x0_d[k-1]; xtop_d[k] <= xtop_d[k-1];
+                xov_d[k] <= xov_d[k-1]; l0_d[k] <= l0_d[k-1];
             end
         end
     end
 
     // ------------------------------------------------------------ stage D
     wire        in_launch = (launch_cnt < LAUNCH_W);
-    wire        all_zero  = (fold_ones == 0);
+    wire        all_zero  = (ones == 0);
+    wire        all_ones  = (ones == FOLD_W);
+    wire        ovl       = ~x0_d[PC-1] & ~all_zero;
     wire [3:0]  n_f       = n_d[PC-1];
-    wire [FINE_BITS-1:0] pos  = FOLD_W - fold_ones;
+    wire [FW:0] pos       = ovl ? ({1'b0, ones} + FOLD_W - {1'b0, ones_t}) : {1'b0, ones};
     wire [FINE_BITS+2:0] full = LAUNCH_W + n_f * FOLD_W + pos;
     localparam [FINE_BITS-1:0] FMAX = {FINE_BITS{1'b1}};
 
@@ -137,10 +156,9 @@ module fold_decode #(
                 fine <= launch_cnt;
             else
                 fine <= (full > FMAX) ? FMAX : full[FINE_BITS-1:0];
-            // launch must be a clean step whose bottom tap carries the hit
-            // (or be empty: code 0, which the host treats as railed).
             valid <= lok_d[PC-VL-1] & (l0_d[PC-1] | (launch_cnt == 0))
-                   & (in_launch | (fok_d[PC-VL-1] & (xt_d[PC-1] | all_zero) & (n_f <= N_MAX)));
+                   & (in_launch | (xok_d[PC-VL-1] & (~xtop_d[PC-1] | all_ones)
+                                   & (~ovl | xov_d[PC-1]) & (n_f <= N_MAX)));
         end
     end
 endmodule
